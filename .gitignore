@@ -239,7 +239,9 @@ nbdist/
 .nb-gradle/
 
 ### VisualStudioCode ###
-.vscode/*
+# `**/` so the per-cell folders VS Code creates (e.g. NeoForge/1.21.10/.vscode/) are caught too;
+# a bare `.vscode/*` only matches at the repo root.
+**/.vscode/
 *.code-workspace
 
 # Local History for Visual Studio Code
