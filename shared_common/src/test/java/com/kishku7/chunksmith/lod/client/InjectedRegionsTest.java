@@ -1,0 +1,177 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.client;
+
+import org.junit.Test;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * The injected-region set and the two bugs it exists to prevent.
+ *
+ * <p>1. The shipped 3.1.0-beta-2 set was keyed by packed region x/z
+ * alone. Region (0,0) is a different place in every dimension, so
+ * the moment the overworld's (0,0) was injected the Nether's (0,0)
+ * was treated as already done and skipped for the rest of the
+ * session (silently, with every counter reporting success). {@link
+ * #theNetherIsNotTheOverworld()} is that bug, pinned.
+ *
+ * <p>2. Keying on (dimension, x, z) and nothing else answers "have I
+ * drawn this region?" when the question the injector needs answered
+ * is "have I drawn THIS VERSION of it?". A pregen does not only
+ * create new regions; it keeps growing the ones under the player for
+ * hours. The sync notices, the cache notices, the downloader
+ * re-fetches the bigger file, and then the injector would look up
+ * the coordinates, find them, and throw the new data on the floor.
+ * {@link #changedRegionIsInjectedAgain()} is that bug, pinned before
+ * it ever shipped.
+ */
+public class InjectedRegionsTest {
+
+    private static final String OVERWORLD = "minecraft_overworld";
+    private static final String NETHER = "minecraft_the_nether";
+    private static final String END = "minecraft_the_end";
+
+    /** A freshness token. Its value is meaningless. Only sameness and difference matter. */
+    private static final long V1 = 0x1111_2222_3333_4444L;
+    private static final long V2 = 0x5555_6666_7777_8888L;
+
+    @Test
+    public void theNetherIsNotTheOverworld() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue("the overworld's region (0,0) is new", injected.claim(OVERWORLD, 0, 0, V1));
+        assertFalse("...and is not claimed twice", injected.claim(OVERWORLD, 0, 0, V1));
+
+        // Under the old x/z-only key this returned false and the Nether's terrain was never drawn.
+        assertTrue("the Nether's (0,0) is a different place",
+                injected.claim(NETHER, 0, 0, V1));
+        assertTrue("...and so is the End's", injected.claim(END, 0, 0, V1));
+
+        assertEquals(3, injected.size());
+    }
+
+    @Test
+    public void changedRegionIsInjectedAgain() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue("first sight of the region", injected.claim(OVERWORLD, 4, -2, V1));
+        assertFalse("the same version is never re-injected", injected.claim(OVERWORLD, 4, -2, V1));
+
+        // The pregen grew it. The server advertises a new token; the client re-downloaded it. If this
+        // returns false the freshly-downloaded terrain is silently discarded and the player's world stays
+        // frozen at the version they joined with.
+        assertTrue("a moved token", injected.claim(OVERWORLD, 4, -2, V2));
+        assertFalse("...but only once, at the new version", injected.claim(OVERWORLD, 4, -2, V2));
+
+        assertEquals("re-claiming replaces, it does not duplicate", 1, injected.size());
+        assertEquals("which version we drew",
+                Long.valueOf(V2), injected.injectedHash(OVERWORLD, 4, -2));
+    }
+
+    @Test
+    public void anyDifferentTokenCounts() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue(injected.claim(OVERWORLD, 0, 0, V1));
+        assertTrue(injected.claim(OVERWORLD, 0, 0, V2));
+        assertTrue("an older token is still a change", injected.claim(OVERWORLD, 0, 0, V1));
+        assertEquals(Long.valueOf(V1), injected.injectedHash(OVERWORLD, 0, 0));
+    }
+
+    @Test
+    public void claimedOncePerDimension() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue(injected.claim(NETHER, -3, 7, V1));
+        assertFalse(injected.claim(NETHER, -3, 7, V1));
+        assertTrue(injected.contains(NETHER, -3, 7));
+
+        // A different region in the same dimension is still new.
+        assertTrue(injected.claim(NETHER, -3, 8, V1));
+        assertFalse(injected.contains(OVERWORLD, -3, 7));
+    }
+
+    @Test
+    public void releaseAllowsAReclaim() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue(injected.claim(OVERWORLD, 5, 5, V1));
+        injected.release(OVERWORLD, 5, 5);
+        assertFalse(injected.contains(OVERWORLD, 5, 5));
+        assertNull(injected.injectedHash(OVERWORLD, 5, 5));
+        assertTrue("a released region is claimable again", injected.claim(OVERWORLD, 5, 5, V1));
+
+        // Releasing one dimension's region must not release another's.
+        assertTrue(injected.claim(NETHER, 5, 5, V1));
+        injected.release(OVERWORLD, 5, 5);
+        assertTrue("the Nether's claim survives the overworld's release", injected.contains(NETHER, 5, 5));
+    }
+
+    @Test
+    public void releaseForgetsEveryVersion() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue(injected.claim(OVERWORLD, 2, 2, V1));
+        assertTrue("the region grew", injected.claim(OVERWORLD, 2, 2, V2));
+        injected.release(OVERWORLD, 2, 2);
+
+        assertFalse(injected.contains(OVERWORLD, 2, 2));
+        assertTrue("the old version too", injected.claim(OVERWORLD, 2, 2, V1));
+    }
+
+    @Test
+    public void negativeCoordinatesRoundTrip() {
+        InjectedRegions injected = new InjectedRegions();
+
+        assertTrue(injected.claim(OVERWORLD, -1, -1, V1));
+        assertFalse(injected.claim(OVERWORLD, -1, -1, V1));
+        // -1,-1 packed into a long is 0xFFFFFFFFFFFFFFFF; 1,1 must not alias it.
+        assertTrue(injected.claim(OVERWORLD, 1, 1, V1));
+        assertTrue(injected.claim(OVERWORLD, -1, 1, V1));
+        assertTrue(injected.claim(OVERWORLD, 1, -1, V1));
+        assertEquals(4, injected.size());
+    }
+
+    @Test
+    public void keysCannotCollide() {
+        assertNotEquals(InjectedRegions.key("a", 1, 2), InjectedRegions.key("a/1", 2, 2));
+        assertEquals("minecraft_the_nether/-3,7", InjectedRegions.key(NETHER, -3, 7));
+    }
+
+    @Test
+    public void clearForgetsAll() {
+        InjectedRegions injected = new InjectedRegions();
+        injected.claim(OVERWORLD, 0, 0, V1);
+        injected.claim(NETHER, 0, 0, V1);
+        assertEquals(2, injected.size());
+
+        injected.clear();
+
+        assertEquals(0, injected.size());
+        assertTrue(injected.claim(OVERWORLD, 0, 0, V1));
+    }
+}

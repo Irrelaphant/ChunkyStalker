@@ -1,0 +1,101 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.net;
+
+/**
+ * The old client asked the server once, at join, and if the store was empty it stood down for the whole
+ * session, no matter how long the player stayed or how far they travelled. That is exactly backwards for
+ * how servers are actually run: an operator starts an hours-long pregen with players already on, the store
+ * fills up behind them, and every one of them keeps staring at an empty horizon until they think to relog.
+ * So the client keeps asking, on a backed-off clock.
+ *
+ * <p>The interval starts short enough that a player who joins seconds before the pregen sees their terrain
+ * almost at once, and doubles to a ceiling so that a player parked on a server which will NEVER have LOD
+ * data costs one tiny packet every couple of minutes.
+ *
+ * <p>A safety net, not the mechanism: a Chunksmith server notifies its waiting players the moment the store
+ * becomes servable. The clock covers an older server that cannot notify, and a store filled by something
+ * other than a pregen. The caller passes the time in, so the whole policy is unit-testable.
+ */
+public final class CsLodRetry {
+
+    /** First retry: short, so a player who joined moments before the pregen barely notices. */
+    public static final long FIRST_DELAY_MILLIS = 15_000L;
+
+    /** Ceiling: a server that will never have LOD data must never cost more than this. */
+    public static final long MAX_DELAY_MILLIS = 120_000L;
+
+    private final long firstDelayMillis;
+    private final long maxDelayMillis;
+
+    private long delayMillis;
+    private long lastAttemptMillis;
+    private int attempts;
+
+    /** The shipped policy: 15s, 30s, 60s, then 120s forever. */
+    public CsLodRetry() {
+        this(FIRST_DELAY_MILLIS, MAX_DELAY_MILLIS);
+    }
+
+    public CsLodRetry(long firstDelayMillis, long maxDelayMillis) {
+        if (firstDelayMillis <= 0L || maxDelayMillis < firstDelayMillis) {
+            throw new IllegalArgumentException("a retry delay must be positive and may not exceed its own ceiling");
+        }
+        this.firstDelayMillis = firstDelayMillis;
+        this.maxDelayMillis = maxDelayMillis;
+        this.delayMillis = firstDelayMillis;
+    }
+
+    /**
+     * Starts the clock, without counting an attempt. Called when the FIRST ask goes out, at the join
+     * handshake. That ask is not a retry, but it is what the first delay is measured from.
+     */
+    public synchronized void started(long nowMillis) {
+        lastAttemptMillis = nowMillis;
+    }
+
+    public synchronized boolean due(long nowMillis) {
+        return nowMillis - lastAttemptMillis >= delayMillis;
+    }
+
+    /** Records an ask, and backs off before the next one. */
+    public synchronized void attempted(long nowMillis) {
+        lastAttemptMillis = nowMillis;
+        attempts++;
+        delayMillis = Math.min(maxDelayMillis, delayMillis * 2L);
+    }
+
+    /** Resets to square one, because the store turned up or we disconnected. */
+    public synchronized void reset() {
+        delayMillis = firstDelayMillis;
+        lastAttemptMillis = 0L;
+        attempts = 0;
+    }
+
+    public synchronized int attempts() {
+        return attempts;
+    }
+
+    public synchronized long delayMillis() {
+        return delayMillis;
+    }
+}

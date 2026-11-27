@@ -1,0 +1,413 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.util;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Stops a pre-gen when the server cannot sustain it, and starts it again when it can.
+ *
+ * <p>Decided 2026-08-20 between "keep crawling", "pause with a clear message and resume when healthy",
+ * and "push through regardless": the middle one, as the default, changeable live. Crawling is the wrong
+ * default because a gated pre-gen on a server that cannot keep up does not stop: it stutters. Measured
+ * on a live server: 60 chunks in two minutes, roughly 0.9 per second, with the never-wedge valve opening
+ * every 120 seconds for about a second of work. That is indistinguishable from a hang, keeps the server
+ * under load throughout, and makes no useful progress.
+ *
+ * <p>Both directions need patience: pausing on the first bad second would stop a run for a passing
+ * autosave, and resuming on the first good second would restart it into the same wall. So each direction
+ * requires the condition to hold continuously for the grace period, on one shared knob.
+ */
+public final class AutoPause {
+
+    /**
+     * Everything this class decides is now also SAID, in the server log.
+     *
+     * <p>mod_support #33: a reporter watched a run stop at 5.08% with "no warnings, no errors,
+     * nothing". Every notice this feature had went to the console SENDER -- a chat channel, not
+     * the log -- so on a client-hosted world the whole mechanism was invisible. A stop that
+     * leaves no trace is indistinguishable from a hang, and four rounds of the ticket were spent
+     * establishing which of the two it was. The log lines below exist so that question is never
+     * asked again: the countdown starting, the pause, the recovery and the resume each say so.
+     */
+    private static final Logger LOGGER = LoggerFactory.getLogger("Chunksmith");
+
+    private static volatile boolean enabled = true;
+    private static volatile long graceMillis = 120_000L;
+    private static volatile long heapThresholdPercent = 85L;
+
+    /**
+     * The longest an auto-pause should last once the machine is coping again.
+     *
+     * <p>The owner's rule: "if a pause has to last more than 10 seconds, some number is wrong."
+     * Pausing and resuming used to share ONE grace knob, so a 120-second pause-side patience also
+     * made every recovery wait two minutes -- a pause of 10 seconds was impossible by
+     * construction, whatever the machine did.
+     *
+     * <p>The two directions are not the same requirement. Patience going IN protects a healthy run
+     * from a passing autosave and costs a little throughput if it is wrong. Patience coming OUT
+     * costs the whole run. So the resume side gets its own, short, grace.
+     */
+    private static final long RESUME_GRACE_CAP_MS = 5_000L;
+
+    /** However patient a repeat becomes, never longer than this -- it must still be a pause. */
+    private static final long RESUME_GRACE_MAX_MS = 60_000L;
+
+    /**
+     * How long a struggling run must have tried before its width may go below the comfort floor.
+     *
+     * <p>This used to be read off {@link #resumeGraceMillis()} doubled, which was fine while that
+     * value was a constant and became a trap the moment it started escalating: making the resume
+     * more patient would silently have made the controller slower to narrow, coupling two
+     * decisions that have nothing to do with each other. It is its own number now, and it is the
+     * same ten seconds the doubled cap used to produce.
+     */
+    private static final long BELOW_FLOOR_GRACE_MS = 10_000L;
+
+    /**
+     * The width the next run should START at, or 0 for "use the configured ceiling".
+     *
+     * <p>Resuming at the width that just failed is how a run saws between generating and pausing.
+     * A resumed run comes back narrow and climbs, so recovery is a step toward a width this
+     * machine can hold rather than a return to the one it could not.
+     */
+    private static volatile int recommendedStartWidth;
+
+    /**
+     * The width that was in flight when the last auto-pause fired, or 0 if none has.
+     *
+     * <p>Carried so a RESUMED run inherits what this machine has already been shown it cannot
+     * hold. Without it the resume threw that away: {@code GenerationTask} reset its slow-start
+     * threshold to the configured ceiling on every run, resumed ones included, so a run that came
+     * back at a width of 1 was immediately allowed to BURST all the way back toward a ceiling of
+     * 200 -- eight steps a sample -- and straight into the wall it had just been stopped by. The
+     * width was being resumed narrow while the permission to leave narrow was being reset wide,
+     * which is the sawtooth wearing a different hat (mod_support #36).
+     */
+    private static volatile int failedWidth;
+
+    /**
+     * Auto-pauses since the last time a run proved it could sustain itself.
+     *
+     * <p>The resume side had no memory at all: every cycle waited the same five seconds, so a
+     * machine that could not carry the run settled into a fixed-period oscillation -- pause,
+     * resume, fail, pause -- and a reporter watched it "pause too often" forever. Repeats now cost
+     * progressively more patience. Reset by {@link #noteSustainedHealth()}, never by a resume:
+     * coming back is not evidence, STAYING back is.
+     */
+    private static volatile int consecutivePauses;
+
+    private static volatile long gatedSince;
+    // Set once the countdown has been announced for the current struggle; see noteStruggling.
+    private static volatile boolean countdownAnnounced;
+    private static volatile long healthySince;
+
+    private static volatile boolean autoPaused;
+    private static volatile String pausedWorld;
+
+    private AutoPause() {
+    }
+
+    /** Sets the auto-pause policy. Called when a run starts, from the config it was created with. */
+    public static void configure(boolean enabled, long graceMillis, long heapThresholdPercent) {
+        AutoPause.enabled = enabled;
+        AutoPause.graceMillis = Math.max(1_000L, graceMillis);
+        AutoPause.heapThresholdPercent = heapThresholdPercent;
+    }
+
+    /**
+     * Decides whether the machine is well enough to carry a run again.
+     *
+     * <p>THE BUG THIS REPLACES (mod_support #33). The resume test used to be two hard-coded
+     * absolutes -- {@code mspt <= 55} and {@code heap < 70} -- while the PAUSE side was
+     * relative: heap from {@code throttleMaxHeapPercent}, and tick from the adaptive
+     * {@link TickBudget#effectiveTarget()} which is allowed up to a 150 ms ceiling. The two
+     * sides therefore answered different questions, and on any machine whose own baseline tick
+     * cost exceeds ~55 ms the resume condition was unreachable BY CONSTRUCTION: the run could
+     * auto-pause and never come back, whatever it did. A reporter sat at 5.08% indefinitely.
+     *
+     * <p>Note what makes it unreachable rather than merely strict: 55 ms is an ABSOLUTE compared
+     * against a machine-RELATIVE reality. Once paused we stop dispatching, so the baseline
+     * re-learns the machine's own idle cost and {@code effectiveTarget} rises to meet it -- the
+     * run becomes sustainable at that target -- while the 55 ms test keeps asking the machine to
+     * be faster than it has ever been. This is the same defect shape the throttle already carries
+     * comments about twice: a trigger keyed to the wrong reference.
+     *
+     * <p>So both arms now use the pause side's own references. Heap: the same point the dispatch
+     * gate itself reopens at, {@code throttleMaxHeapPercent - RESUME_MARGIN_PERCENT}, floored at
+     * 50 exactly as {@link HeapPressure} floors it. Tick: at or under the effective target plus
+     * the throttle's own dead-band.
+     *
+     * <p>An UNMEASURED target (-1, before a baseline exists) counts as healthy on the tick arm.
+     * That is deliberate: refusing to resume on the absence of a measurement is how a latch gets
+     * built, and the cost of being wrong is bounded -- the run resumes, finds it cannot sustain
+     * itself, and auto-pauses again after the grace period, saying so in the log both times.
+     */
+    public static boolean healthyNow(double mspt, double heapUsedPercent) {
+        double heapResumeAt = Math.max(50.0D,
+                (double) heapThresholdPercent - HeapPressure.RESUME_MARGIN_PERCENT);
+        boolean heapOk = heapUsedPercent >= 0.0D && heapUsedPercent < heapResumeAt;
+        double target = TickBudget.effectiveTarget();
+        boolean tickOk = mspt < 0.0D || target < 0.0D || mspt <= target + TickBudget.MSPT_BAND;
+        return heapOk && tickOk;
+    }
+
+    /** One line naming which arm of {@link #healthyNow} is holding a paused run down. */
+    public static String describeHealth(double mspt, double heapUsedPercent) {
+        double heapResumeAt = Math.max(50.0D,
+                (double) heapThresholdPercent - HeapPressure.RESUME_MARGIN_PERCENT);
+        double target = TickBudget.effectiveTarget();
+        return String.format("heap=%.1f%s (resume under %.0f) mspt=%.1f target=%s band=%.0f",
+                heapUsedPercent, "pct", heapResumeAt, mspt,
+                target < 0.0D ? "unmeasured" : String.format("%.1f", target),
+                TickBudget.MSPT_BAND);
+    }
+
+    public static boolean isEnabled() {
+        return enabled;
+    }
+
+    public static long graceMillis() {
+        return graceMillis;
+    }
+
+    /**
+     * Records whether the server is currently unable to sustain the run.
+     *
+     * <p>"Our gate is closed" was too narrow. On a live server with the chunk gate off and the heap
+     * under its threshold, nothing of ours ever closed while the server logged twelve "Can't keep up"
+     * warnings and generation fell to 5 chunks per second. So it is either gate holding, OR the tick running
+     * far past the target the throttle steers to.
+     *
+     * <p>WHAT GETS ANNOUNCED, AND WHEN (mod_support #37). This used to WARN "if this holds for 120s the
+     * run will AUTO-PAUSE" the moment any struggle began, and then cancel it on the next good sample.
+     * Two things were wrong with that. It fired on every dip, so a healthy-but-busy run printed it
+     * continuously. And it was often simply untrue: a pause also needs the width at its hard minimum
+     * ({@link #shouldPause(long, boolean)}), and a hold by one of our gates -- the heap guard above
+     * all -- never narrows the width, so the promised pause could not happen. A reporter watched that
+     * promise sit unkept for twenty minutes and reasonably read it as a hang. So the countdown is now
+     * announced only when it is REAL: struggling, at the hard minimum, with time still left on the
+     * clock. The gates announce their own holds, with their own numbers.
+     *
+     * @param struggling    whether the server cannot sustain the run right now
+     * @param atHardMinimum whether the dispatch width can go no lower, the other half of the pause test
+     * @param now           the clock, in milliseconds
+     */
+    public static void noteStruggling(boolean struggling, boolean atHardMinimum, long now) {
+        if (!struggling) {
+            // Only worth a line if a countdown was actually announced: this is called every pass.
+            if (countdownAnnounced && gatedSince != 0L && enabled && !autoPaused) {
+                LOGGER.info("Chunksmith: the server recovered after {}s of struggling -- the"
+                                + " auto-pause countdown is cancelled.",
+                        Math.max(0L, (now - gatedSince) / 1000L));
+            }
+            gatedSince = 0L;
+            countdownAnnounced = false;
+            return;
+        }
+        if (gatedSince == 0L) {
+            gatedSince = now;
+        }
+        if (atHardMinimum && enabled && !autoPaused && !countdownAnnounced) {
+            long left = graceMillis - (now - gatedSince);
+            // Under a second left means the pause itself is next, and it logs its own line.
+            if (left >= 1_000L) {
+                LOGGER.warn("Chunksmith: the pre-gen is at its narrowest and the server still cannot"
+                                + " sustain it. It will AUTO-PAUSE in {}s unless the server recovers first.",
+                        left / 1000L);
+                countdownAnnounced = true;
+            }
+        }
+    }
+
+    /** Whether the current struggle has had its auto-pause countdown announced. Test seam. */
+    static boolean countdownAnnounced() {
+        return countdownAnnounced;
+    }
+
+    /** @deprecated use {@link #shouldPause(long, boolean)}, so no caller silently loses the floor test. */
+    @Deprecated
+    public static boolean shouldPause(long now) {
+        return shouldPause(now, true);
+    }
+
+    /**
+     * True once generation has been held continuously for the whole grace period AND there is
+     * nothing left to try.
+     *
+     * <p>{@code atHardMinimum} is the owner's rule in code: pausing "should be a last resort, and
+     * only after a good hard try". The controller can always make itself narrower, and a narrower
+     * run still generates; an auto-pause generates nothing. So a run with room left to slow down
+     * slows down instead, and only a run already at {@link DispatchControl#MIN_WORKING_WIDTH} that
+     * STILL cannot keep up has earned a pause.
+     *
+     * <p>This used to fire on time alone, which is how a client with a perfectly usable width of
+     * 16 available to it stopped dead at 5.08% instead (mod_support #33).
+     *
+     * @param atHardMinimum true when the dispatch width can go no lower
+     */
+    public static boolean shouldPause(long now, boolean atHardMinimum) {
+        return enabled && !autoPaused && atHardMinimum
+                && gatedSince != 0L && now - gatedSince >= graceMillis;
+    }
+
+    public static long strugglingSeconds(long now) {
+        return gatedSince == 0L ? 0L : Math.max(0L, (now - gatedSince) / 1000L);
+    }
+
+    /** Records that we paused this world, so only our own pause is ever auto-resumed. */
+    public static void markAutoPaused(String world) {
+        autoPaused = true;
+        pausedWorld = world;
+        gatedSince = 0L;
+        countdownAnnounced = false;
+        healthySince = 0L;
+        consecutivePauses++;
+    }
+
+    public static boolean isAutoPaused() {
+        return autoPaused;
+    }
+
+    public static String pausedWorld() {
+        return pausedWorld;
+    }
+
+    /** Records whether the server currently looks well enough to carry a run. */
+    public static void noteHealthy(boolean healthy, long now) {
+        if (!healthy) {
+            healthySince = 0L;
+        } else if (healthySince == 0L) {
+            healthySince = now;
+        }
+    }
+
+    /**
+     * How long health must hold before a paused run restarts. Short, and never the pause-side
+     * grace -- see {@link #RESUME_GRACE_CAP_MS}.
+     *
+     * <p>DOUBLES ON EVERY CONSECUTIVE PAUSE (mod_support #36). The first resume is as eager as it
+     * ever was, because the common case is a passing autosave and five seconds is the right answer
+     * to it. But a machine that pauses, resumes and fails again has told us something, and
+     * answering it with the same five seconds is how the oscillation sustains itself. Bounded both
+     * ways: never longer than the pause-side grace, and never longer than
+     * {@link #RESUME_GRACE_MAX_MS}, because a pause that outlasts its own patience is a stop.
+     */
+    public static long resumeGraceMillis() {
+        long base = Math.min(graceMillis, RESUME_GRACE_CAP_MS);
+        int repeats = Math.max(0, consecutivePauses - 1);
+        // Shift, not pow: the cap below makes anything past a handful of doublings moot, and
+        // clamping the shift keeps it honest if consecutivePauses ever runs away.
+        long scaled = base << Math.min(repeats, 16);
+        long ceiling = Math.min(graceMillis, RESUME_GRACE_MAX_MS);
+        return Math.max(Math.min(scaled, ceiling), Math.min(base, ceiling));
+    }
+
+    /** How long a struggling run must try before its width may drop below the comfort floor. */
+    public static long belowFloorGraceMillis() {
+        return Math.min(graceMillis, BELOW_FLOOR_GRACE_MS);
+    }
+
+    /** The width the last auto-pause fired at, or 0 if none has. */
+    public static int failedWidth() {
+        return failedWidth;
+    }
+
+    /** Consecutive auto-pauses with no sustained healthy run between them. */
+    public static int consecutivePauses() {
+        return consecutivePauses;
+    }
+
+    /**
+     * Records that a run has held a width healthily for long enough to be believed.
+     *
+     * <p>This is what clears the repeat counter, and it is deliberately NOT the resume: a run that
+     * comes back and fails again has not proved anything, and treating the resume as success is
+     * what would let the escalation reset itself every cycle and never escalate at all.
+     */
+    public static void noteSustainedHealth() {
+        consecutivePauses = 0;
+    }
+
+    /** True once the server has looked healthy continuously for the resume grace. */
+    public static boolean shouldResume(long now) {
+        return enabled && autoPaused && healthySince != 0L
+                && now - healthySince >= resumeGraceMillis();
+    }
+
+    /** The width a resumed run should start at, or 0 when there is no recommendation. */
+    public static int recommendedStartWidth() {
+        return recommendedStartWidth;
+    }
+
+    /**
+     * Records that the width in use was not survivable, so the next run starts below it.
+     *
+     * <p>Halved rather than reused: the run reached this width by stepping DOWN to it and still
+     * could not hold it, so it is an upper bound on what works, not a target.
+     */
+    public static void noteWidthFailed(int width) {
+        recommendedStartWidth = Math.max(DispatchControl.MIN_WORKING_WIDTH, width / 2);
+        failedWidth = Math.max(0, width);
+    }
+
+    /**
+     * Says in the LOG that an auto-paused run is being restarted.
+     *
+     * <p>It lives here rather than at the mixin call site so every loader and version cell gets
+     * the same line from one place, and so the logger dependency stays in shared_common.
+     */
+    public static void logAutoResumed(String world, long healthySeconds) {
+        LOGGER.warn("Chunksmith: AUTO-RESUMING the pre-gen for {} -- the server has looked healthy"
+                        + " for {}s.",
+                world == null ? "the paused world" : world, healthySeconds);
+    }
+
+    public static void clearAutoPaused() {
+        autoPaused = false;
+        pausedWorld = null;
+        healthySince = 0L;
+        gatedSince = 0L;
+        countdownAnnounced = false;
+    }
+
+    /** Clears every remembered state, for a human pause, a new run, or a stopping server. */
+    public static void clear() {
+        autoPaused = false;
+        pausedWorld = null;
+        gatedSince = 0L;
+        countdownAnnounced = false;
+        healthySince = 0L;
+        recommendedStartWidth = 0;
+        failedWidth = 0;
+        consecutivePauses = 0;
+    }
+
+    /** Returns one line for the debug command. No literal percent sign, because the sender formats it. */
+    public static String describe() {
+        return String.format(
+                "enabled=%s grace=%ds resumeGrace=%ds autoPaused=%s world=%s repeats=%d failedWidth=%d",
+                enabled, graceMillis / 1000L, resumeGraceMillis() / 1000L, autoPaused,
+                pausedWorld == null ? "none" : pausedWorld, consecutivePauses, failedWidth);
+    }
+}

@@ -1,0 +1,531 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.platform;
+
+import org.bukkit.configuration.file.FileConfigurationOptions;
+import com.kishku7.chunksmith.ChunksmithBukkit;
+import com.kishku7.chunksmith.util.Input;
+import com.kishku7.chunksmith.util.Translator;
+
+import java.lang.reflect.InvocationTargetException;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+
+public final class BukkitConfig implements Config {
+    /** Matches the mod's ceiling; see Config#getLodIndexBudgetMb. A terabyte, in megabytes. */
+    private static final long LOD_INDEX_BUDGET_MB_MAX = 1L << 20;
+
+    /** The documentation page. Kept as a constant so there is one place to correct it. */
+    private static final String CONFIG_DOCS = "https://github.com/Kishku7/Chunksmith/wiki/Server-Settings";
+
+    /**
+     * The comment written at the top of a generated config.yml.
+     *
+     * <p>The URL used to be github.com/pop4959/Chunksmith/wiki/Configuration, which never existed:
+     * it was produced by renaming the Chunky fork (pop4959's repo is Chunky, not Chunksmith) and
+     * nobody who wrote the code ever had cause to read the file it was written into. A user
+     * followed it to a 404 and asked where the documentation was, which is mod_support #24 and the
+     * reason the wiki now exists.
+     */
+    private static final List<String> HEADER = Arrays.asList(
+            "Chunksmith Configuration",
+            "Every setting here, with its default and range: " + CONFIG_DOCS,
+            "Everything is also settable in-game with /cs set <name> <value>, which applies",
+            "immediately and rewrites this file.");
+
+    private final ChunksmithBukkit plugin;
+
+    public BukkitConfig(ChunksmithBukkit plugin) {
+        this.plugin = plugin;
+        FileConfigurationOptions options = plugin.getConfig().options();
+        options.copyDefaults(true);
+        try {
+            FileConfigurationOptions.class.getMethod("header", String.class).invoke(options, String.join("\n", HEADER));
+        } catch (IllegalAccessException | InvocationTargetException | NoSuchMethodException e) {
+            options.setHeader(HEADER);
+        }
+        plugin.saveConfig();
+        Translator.setLanguage(getLanguage());
+    }
+
+    @Override
+    public Path getDirectory() {
+        return plugin.getDataFolder().toPath();
+    }
+
+    @Override
+    public int getVersion() {
+        return plugin.getConfig().getInt("version", 0);
+    }
+
+    @Override
+    public String getLanguage() {
+        return Input.checkLanguage(plugin.getConfig().getString("language", "en"));
+    }
+
+    @Override
+    public boolean getContinueOnRestart() {
+        return plugin.getConfig().getBoolean("continue-on-restart", false);
+    }
+
+    @Override
+    public boolean isForceLoadExistingChunks() {
+        return plugin.getConfig().getBoolean("force-load-existing-chunks", false);
+    }
+
+    @Override
+    public boolean isSilent() {
+        return plugin.getConfig().getBoolean("silent", false);
+    }
+
+    @Override
+    public void setSilent(boolean silent) {
+        plugin.getConfig().set("silent", silent);
+    }
+
+    @Override
+    public int getUpdateInterval() {
+        return plugin.getConfig().getInt("update-interval", 1);
+    }
+
+    @Override
+    public void setUpdateInterval(int updateInterval) {
+        plugin.getConfig().set("update-interval", updateInterval);
+    }
+
+    @Override
+    public boolean isIoThrottleEnabled() {
+        return plugin.getConfig().getBoolean("io-throttle", true);
+    }
+
+    @Override
+    public double getThrottleTargetMspt() {
+        return plugin.getConfig().getDouble("throttle-target-mspt", 150.0D);
+    }
+
+    @Override
+    public long getThrottleMaxChunkMillis() {
+        return plugin.getConfig().getLong("throttle-max-chunk-millis", 750L);
+    }
+
+    @Override
+    public long getThrottleMaxQueuedWrites() {
+        return plugin.getConfig().getLong("throttle-max-queued-writes", 800L);
+    }
+
+    @Override
+    public long getThrottleMaxAddedChunks() {
+        return plugin.getConfig().getLong("throttle-max-added-chunks", 0L);
+    }
+
+    @Override
+    public long getThrottleMaxHeapPercent() {
+        return plugin.getConfig().getLong("throttle-max-heap-percent", 85L);
+    }
+
+    @Override
+    public long getThrottleTickBudgetMillis() {
+        return plugin.getConfig().getLong("throttle-tick-budget-millis", 25L);
+    }
+
+    @Override
+    public long getThrottlePlayerReserveMillis() {
+        return plugin.getConfig().getLong("throttle-player-reserve-millis", 20L);
+    }
+
+    @Override
+    public long getThrottleCeilingMillis() {
+        return plugin.getConfig().getLong("throttle-ceiling-millis", 150L);
+    }
+
+    @Override
+    public boolean isAutoPauseEnabled() {
+        return plugin.getConfig().getBoolean("auto-pause-on-overload", true);
+    }
+
+    @Override
+    public int getAutoPauseGraceSeconds() {
+        return plugin.getConfig().getInt("auto-pause-grace-seconds", 120);
+    }
+
+    /**
+     * AUTO means ON here (mod_support #9 follow-up). A Bukkit/Paper/Folia
+     * process is always the dedicated-server case, which the mod-loader
+     * {@code decide()} already treats as ON regardless of a local renderer.
+     * This platform does now carry the server-side CSLOD generator and store
+     * (see lod.CsLodExtractor / lod.LodSupport), just no renderer feed or
+     * client-streaming channel yet. Accepts auto, true or false, parsed
+     * exactly as on every other platform; an operator sets lod-enabled: false
+     * in config.yml to turn it off.
+     */
+    @Override
+    public LodMode getLodMode() {
+        String raw = plugin.getConfig().getString("lod-enabled", "auto");
+        LodMode mode = LodMode.parse(raw);
+        if (mode == null) {
+            plugin.getLogger().warning("Chunksmith: lod-enabled '" + raw + "' is not one of auto/true/false, using auto");
+            return LodMode.AUTO;
+        }
+        return mode;
+    }
+
+    @Override
+    public boolean isPregenSettleEnabled() {
+        // The Bukkit platform does not manage chunk tickets itself, so there is nothing to hold open
+        // and nothing for a settle window to do. Reported honestly rather than defaulted to true.
+        return false;
+    }
+
+    @Override
+    public long getPregenSettleDelayTicks() {
+        return 0L;
+    }
+
+    @Override
+    public int getPregenSettleRadius() {
+        return 1;
+    }
+
+    @Override
+    public long getPregenSettleMaxHeld() {
+        // Nothing is ever held on this platform (see isPregenSettleEnabled), so there is nothing to cap.
+        return 0L;
+    }
+
+    @Override
+    public boolean isPregenSettleSupported() {
+        return false;
+    }
+
+    // The three setters below are deliberately no-ops rather than throws. isPregenSettleSupported()
+    // is false, so /cs settle refuses before it ever reaches them; a throw here would only turn a
+    // future caller's oversight into a crash on a live server for a setting that does nothing anyway.
+
+    @Override
+    public void setPregenSettleEnabled(boolean enabled) {
+        // no-op: Bukkit does not manage chunk tickets, so there is no window to open
+    }
+
+    @Override
+    public void setPregenSettleDelayTicks(long ticks) {
+        // no-op: see setPregenSettleEnabled
+    }
+
+    @Override
+    public void setPregenSettleRadius(int radius) {
+        // no-op: see setPregenSettleEnabled
+    }
+
+    @Override
+    public long getThrottleMaxLodQueue() {
+        return plugin.getConfig().getLong("throttle-max-lod-queue", 512L);
+    }
+
+    @Override
+    public long getDispatchMaxConcurrent() {
+        return plugin.getConfig().getLong("dispatch-max-concurrent", DISPATCH_MAX_CONCURRENT_DEFAULT);
+    }
+
+    @Override
+    public boolean isLodDhOverrideEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isLodFromExploredChunksEnabled() {
+        return plugin.getConfig().getBoolean("lod-from-explored-chunks", true);
+    }
+
+    @Override
+    public boolean isLodBackgroundSendEnabled() {
+        return plugin.getConfig().getBoolean("lod-background-send", true);
+    }
+
+    @Override
+    public int getLodBackchannelPort() {
+        return plugin.getConfig().getInt("lod-backchannel-port", 0);
+    }
+
+    @Override
+    public long getLodIndexBudgetMb() {
+        long raw = plugin.getConfig().getLong("lod-index-budget-mb", LOD_INDEX_BUDGET_MB_DEFAULT);
+        // Out of range is no budget, not a clamped one, matching the mod. See
+        // Config#getLodIndexBudgetMb for why the ceiling is not a recommendation.
+        return (raw <= 0L || raw > LOD_INDEX_BUDGET_MB_MAX) ? 0L : raw;
+    }
+
+    @Override
+    public boolean isWorldEnterPregenEnabled() {
+        // Always off here, and not a config key. The feature is a single-player world-entry
+        // experience: it freezes the world and shows the player a progress screen before handing
+        // them control. A dedicated server has no world-entry moment and nobody to show a screen
+        // to. Reported honestly rather than read from config.yml and then quietly ignored.
+        return false;
+    }
+
+    @Override
+    public boolean isWorldEnterPregenSupported() {
+        return false;
+    }
+
+    @Override
+    public long getWorldEnterPregenRadius() {
+        return 4096L;
+    }
+
+    @Override
+    public long getWorldEnterLodHorizon() {
+        // No world-enter pregen on a plugin server (see isWorldEnterPregenSupported).
+        return 0L;
+    }
+
+    @Override
+    public String getWorldEnterPregenCenter() {
+        // Reported honestly rather than read from config.yml: the feature itself is unsupported here
+        // (see isWorldEnterPregenSupported), so a centre key would be one an operator could set and
+        // never observe. 'origin' is what this platform would do if it did anything.
+        return "origin";
+    }
+
+    @Override
+    public String getWorldEnterPregenShape() {
+        // Same reason as the centre above: the feature is unsupported here.
+        return "circle";
+    }
+
+    @Override
+    public String getWorldEnterPregenDimensions() {
+        return "overworld";
+    }
+
+    @Override
+    public String getLodBackchannelBindAddress() {
+        return Input.checkHost(plugin.getConfig().getString("lod-backchannel-bind-address", ""));
+    }
+
+    @Override
+    public String getLodBackchannelHost() {
+        return Input.checkAdvertisedHost(plugin.getConfig().getString("lod-backchannel-host", ""));
+    }
+
+    @Override
+    public void setLanguage(String language) {
+        plugin.getConfig().set("language", Input.checkLanguage(language));
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setContinueOnRestart(boolean continueOnRestart) {
+        plugin.getConfig().set("continue-on-restart", continueOnRestart);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setForceLoadExistingChunks(boolean forceLoadExistingChunks) {
+        plugin.getConfig().set("force-load-existing-chunks", forceLoadExistingChunks);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setIoThrottleEnabled(boolean enabled) {
+        plugin.getConfig().set("io-throttle", enabled);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleTargetMspt(double mspt) {
+        plugin.getConfig().set("throttle-target-mspt", mspt);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxChunkMillis(long millis) {
+        plugin.getConfig().set("throttle-max-chunk-millis", millis);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxQueuedWrites(long writes) {
+        plugin.getConfig().set("throttle-max-queued-writes", writes);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxAddedChunks(long chunks) {
+        plugin.getConfig().set("throttle-max-added-chunks", chunks);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxHeapPercent(long percent) {
+        plugin.getConfig().set("throttle-max-heap-percent", percent);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleTickBudgetMillis(long millis) {
+        plugin.getConfig().set("throttle-tick-budget-millis", millis);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottlePlayerReserveMillis(long millis) {
+        plugin.getConfig().set("throttle-player-reserve-millis", millis);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleCeilingMillis(long millis) {
+        plugin.getConfig().set("throttle-ceiling-millis", millis);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setAutoPauseEnabled(boolean enabled) {
+        plugin.getConfig().set("auto-pause-on-overload", enabled);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setAutoPauseGraceSeconds(int seconds) {
+        plugin.getConfig().set("auto-pause-grace-seconds", seconds);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setPregenSettleMaxHeld(long maxHeld) {
+        // Accepted and persisted so the key round-trips, but this platform holds no tickets to cap.
+        plugin.getConfig().set("pregen-settle-max-held", maxHeld);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public long getThrottleLodDrainTo() {
+        return Math.max(0L, plugin.getConfig().getLong("throttle-lod-drain-to", 0L));
+    }
+
+    @Override
+    public void setThrottleLodDrainTo(long items) {
+        plugin.getConfig().set("throttle-lod-drain-to", Math.max(0L, items));
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxLodQueue(long items) {
+        plugin.getConfig().set("throttle-max-lod-queue", items);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setDispatchMaxConcurrent(long chunks) {
+        plugin.getConfig().set("dispatch-max-concurrent", chunks);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodMode(LodMode mode) {
+        plugin.getConfig().set("lod-enabled", mode.name().toLowerCase(Locale.ROOT));
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodDhOverrideEnabled(boolean enabled) {
+        plugin.getConfig().set("lod-dh-override", enabled);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodFromExploredChunksEnabled(boolean enabled) {
+        plugin.getConfig().set("lod-from-explored-chunks", enabled);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodBackgroundSendEnabled(boolean enabled) {
+        plugin.getConfig().set("lod-background-send", enabled);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodBackchannelPort(int port) {
+        plugin.getConfig().set("lod-backchannel-port",
+                (port < 1024 || port > 65535) ? 0 : port);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodIndexBudgetMb(long megabytes) {
+        plugin.getConfig().set("lod-index-budget-mb",
+                (megabytes <= 0L || megabytes > LOD_INDEX_BUDGET_MB_MAX) ? 0L : megabytes);
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterPregenEnabled(boolean enabled) {
+        // No-op: see isWorldEnterPregenEnabled. Storing it would create a key that reads back as
+        // false however it is set, which is worse than not having it.
+    }
+
+    @Override
+    public void setWorldEnterPregenRadius(long blocks) {
+        // No-op, same reason.
+    }
+
+    @Override
+    public void setWorldEnterLodHorizon(long blocks) {
+        // No-op, same reason.
+    }
+
+    @Override
+    public void setWorldEnterPregenCenter(String spec) {
+        // No-op, same reason.
+    }
+
+    @Override
+    public void setWorldEnterPregenShape(String shape) {
+        // No-op, same reason.
+    }
+
+    @Override
+    public void setWorldEnterPregenDimensions(String spec) {
+        // No-op, same reason.
+    }
+
+    @Override
+    public void setLodBackchannelBindAddress(String address) {
+        plugin.getConfig().set("lod-backchannel-bind-address", Input.checkHost(address));
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void setLodBackchannelHost(String host) {
+        plugin.getConfig().set("lod-backchannel-host", Input.checkAdvertisedHost(host));
+        plugin.saveConfig();
+    }
+
+    @Override
+    public void reload() {
+        plugin.reloadConfig();
+    }
+}

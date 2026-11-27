@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "${id}",
+  "version": "${version}",
+  "name": "${name}",
+  "description": "${description}",
+  "authors": [
+    "${author}"
+  ],
+  "contributors": [
+    "pop4959 (original Chunky author)"
+  ],
+  "contact": {
+    "website": "${github}",
+    "homepage": "${github}",
+    "repo": "${github}",
+    "sources": "${github}",
+    "issues": "https://github.com/Kishku7/mod_support/issues"
+  },
+  "license": "GPLv3",
+  "icon": "assets/chunksmith/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.kishku7.chunksmith.ChunksmithFabric",
+      "com.kishku7.chunksmith.lod.LodInit"
+    ],
+    "client": [
+      "com.kishku7.chunksmith.lod.client.LodClientInit",
+      "com.kishku7.chunksmith.lod.client.CsLodClientCommandInit",
+      "com.kishku7.chunksmith.worldenter.client.WorldEnterClientInit"
+    ]
+  },
+  "mixins": [
+    "chunksmith.mixins.json",
+    {
+      "config": "chunksmith_lodclient.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "fabric-api": "*",
+    "minecraft": ">=1.21.11 <1.22",
+    "java": ">=21"
+  },
+  "suggests": {
+    "distanthorizons": ">=2.3.0-b"
+  },
+  "breaks": {
+    "lss": "*",
+    "voxyserver": "*",
+    "lodserver": "*"
+  }
+}

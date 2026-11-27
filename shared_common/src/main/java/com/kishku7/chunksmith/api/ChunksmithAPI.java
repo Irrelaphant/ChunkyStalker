@@ -1,0 +1,49 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.api;
+
+import com.kishku7.chunksmith.api.event.task.GenerationCompleteEvent;
+import com.kishku7.chunksmith.api.event.task.GenerationProgressEvent;
+
+import java.util.function.Consumer;
+
+@SuppressWarnings("unused")
+public interface ChunksmithAPI {
+    int version();
+
+    boolean isRunning(String world);
+
+    boolean startTask(String world, String shape, double centerX, double centerZ, double radiusX, double radiusZ, String pattern);
+
+    /** As above, with an LOD horizon in blocks (0 = off): chunks past it are generated for LOD only, never saved. */
+    boolean startTask(String world, String shape, double centerX, double centerZ, double radiusX, double radiusZ, String pattern, double lodHorizon);
+
+    boolean pauseTask(String world);
+
+    boolean continueTask(String world);
+
+    boolean cancelTask(String world);
+
+    void onGenerationProgress(Consumer<GenerationProgressEvent> listener);
+
+    void onGenerationComplete(Consumer<GenerationCompleteEvent> listener);
+}

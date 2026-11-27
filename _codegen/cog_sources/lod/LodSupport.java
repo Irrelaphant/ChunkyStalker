@@ -1,0 +1,460 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod;
+
+import com.kishku7.chunksmith.util.WorldEnterLod;
+import com.kishku7.chunksmith.util.WorldEnterFreeze;
+import com.kishku7.chunksmith.util.RendererNames;
+import com.kishku7.chunksmith.lod.CsLodWorldId;
+import com.kishku7.chunksmith.ChunksmithProvider;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.storage.LevelResource;
+
+import java.util.Locale;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import com.kishku7.chunksmith.platform.Config;
+import com.kishku7.chunksmith.platform.LodMode;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Resolves the active {@link LodSink} per world, and drives the generation hook.
+ *
+ * <p>Gates, in order:
+ * <ol>
+ *   <li><b>{@code lodEnabled}: a tristate, default {@code auto}.</b> See {@link #decide}; the decision
+ *       is logged once, at server start, by {@link #announce(MinecraftServer)}.</li>
+ *   <li><b>CSLOD store</b>: always on when LOD is enabled. The durable, mod-independent artifact: it
+ *       outlives voxy's storage format, and it is what feeds Distant Horizons and remote clients.</li>
+ *   <li><b>voxy</b>: only where a voxy jar exists to compile against and voxy is actually installed:
+ *       Fabric 1.21.11 and Fabric 26 only. voxy is Fabric-only and was never published for 1.20.1 or
+ *       1.21.1, so every other cell carries the store path alone, which is what a dedicated server
+ *       needs anyway, voxy's engine being client-side.</li>
+ * </ol>
+ *
+ * <p><b>Distant Horizons is not a sink.</b> DH pulls (through the world-generator override) and is pushed
+ * to on demand ({@code /cslod dhpush}); it is never fed from this hot path. See {@link CsLodDhSupport}.
+ */
+public final class LodSupport {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("Chunksmith");
+
+    /** Bounded queue for the CSLOD writer thread. The throttle's governor keeps depth far below this. */
+    private static final int WRITE_QUEUE_CAPACITY = 2048;
+
+    private static final Map<String, LodSink> SINKS = new ConcurrentHashMap<>();
+
+    /** Presence index per dimension id. Keyed exactly as SINKS is, and as {@code World.getName()} reports. */
+    private static final Map<String, CsLodPresenceIndex> PRESENCE = new ConcurrentHashMap<>();
+
+    private LodSupport() {
+    }
+
+    /**
+     * Publishes the CSLOD presence provider, so the pregen's skip decision can see the store. That is the
+     * whole wiring for "a re-run fills LOD holes". {@code GenerationTask} lives in shared_common and cannot
+     * see this class; it asks {@link LodPresence}, and this is what answers.
+     */
+    public static void install(MinecraftServer server) {
+        LodPresence.setProvider(worldName -> presenceIndexFor(server, worldName));
+        HorizonGuard.install(server);
+    }
+
+    /**
+     * Returns the presence index for a world, or null when LOD generation is off. Null is load-bearing. It is
+     * how {@code GenerationTask} is told "do not do any of this", which is what makes
+     * {@code lodEnabled: false} restore the old skip behaviour byte for byte.
+     *
+     * @return the presence index, or null when LOD generation is off
+     */
+    public static CsLodPresenceIndex presenceIndexFor(MinecraftServer server, String worldName) {
+        if (server == null || !lodEnabled(server)) {
+            return null;
+        }
+        ServerLevel level = levelByName(server, worldName);
+        if (level == null) {
+            return null;
+        }
+        return PRESENCE.computeIfAbsent(worldName, ignored -> new CsLodPresenceIndex(storeRoot(level)));
+    }
+
+    /** Returns the level whose dimension id matches the string given by {@code World.getName()}. */
+    private static ServerLevel levelByName(MinecraftServer server, String worldName) {
+        for (ServerLevel level : server.getAllLevels()) {
+            if (dimensionId(level).equals(worldName)) {
+                return level;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Offers a freshly generated chunk. Called from the generation hook on the main thread, while the chunk
+     * is still ticket-pinned. Extraction happens here, synchronously, because the chunk is unloaded the
+     * moment the ticket is released. Everything downstream of extraction is asynchronous.
+     */
+    public static void offer(ServerLevel level, LevelChunk chunk) {
+        if (!lodEnabled(level.getServer())) {
+            return;
+        }
+        LodSink sink = sinkFor(level);
+        if (sink == LodSink.NOOP) {
+            return;
+        }
+
+        // voxy wants the live chunk; the CSLOD store wants an extracted record. Each sink ignores
+        // what it does not recognise, so offer both.
+        sink.offer(chunk);
+
+        if (hasStore(sink)) {
+            CsLodChunk record = CsLodExtractor.extract(chunk);
+            if (record != null) {
+                sink.offer(record);
+            }
+        }
+    }
+
+    /**
+     * Returns the active sink for a world, resolved once. Never null.
+     *
+     * @return the sink for this world, never null
+     */
+    public static LodSink sinkFor(ServerLevel level) {
+        String key = dimensionId(level);
+        return SINKS.computeIfAbsent(key, ignored -> create(level));
+    }
+
+    /**
+     * Flushes and closes every sink. Wired to the server-stopped lifecycle event by {@code LodInit}, since
+     * otherwise a pregen that ends at shutdown would lose whatever was still queued.
+     */
+    public static void shutdown() {
+        for (LodSink sink : SINKS.values()) {
+            for (LodSink leaf : leaves(sink)) {
+                if (leaf instanceof final CsLodStoreSink store) {
+                    LOGGER.info(String.format(
+                            "Chunksmith: LOD store: %d chunks, %d bytes (%.1f KB/chunk), %d synchronous writes",
+                            store.getWrittenCount(), store.getWrittenBytes(),
+                            store.getWrittenCount() == 0 ? 0.0
+                                    : store.getWrittenBytes() / 1024.0 / store.getWrittenCount(),
+                            store.getSynchronousWrites()));
+                    store.shutdown();
+                }
+            }
+        }
+        // After every store above is flushed and closed, so the region tokens it records are final.
+        LiveFeedLedger.finishAll();
+        ExploredLod.reset();
+        SINKS.clear();
+        LodSinks.set(LodSink.NOOP);
+        // Unpublish the presence provider with the sinks: a stale provider would hand a later run an
+        // index pointing at a dead server's store root.
+        LodPresence.setProvider(null);
+        PRESENCE.clear();
+    }
+
+    private static LodSink create(ServerLevel level) {
+        List<LodSink> sinks = new ArrayList<>(2);
+
+        Path root = storeRoot(level);
+        sinks.add(new CsLodStoreSink(root, WRITE_QUEUE_CAPACITY));
+        LOGGER.info("Chunksmith: LOD store enabled -> {}", root);
+
+        //[[[cog
+        // import cog, compat
+        // if compat.has_voxy(mcver, loader):
+        //     cog.outl('if (LodPlatform.isModLoaded("voxy")) {')
+        //     cog.outl('    try {')
+        //     cog.outl('        sinks.add(new VoxyLodSink(root));')
+        //     cog.outl('        LOGGER.info("Chunksmith: voxy detected -- feeding LODs to voxy as well");')
+        //     cog.outl('    } catch (final LinkageError error) {')
+        //     cog.outl('        LOGGER.warn("Chunksmith: voxy present but incompatible, skipping voxy sink: {}", error.toString());')
+        //     cog.outl('    }')
+        //     cog.outl('}')
+        // else:
+        //     cog.outl("// No voxy sink on this cell: voxy is Fabric-only and upstream has never published a build")
+        //     cog.outl("// for this (loader, MC), so there is nothing to compile VoxyLodSink against -- the seam is")
+        //     cog.outl("// compile-time ABSENT, not stubbed. Distant Horizons still gets its LODs here (CsLodDhSupport),")
+        //     cog.outl("// and a dedicated server serves the CSLOD store to connecting clients over the backchannel.")
+        //]]]
+        //[[[end]]]
+
+        LodSink sink = sinks.size() == 1 ? sinks.get(0) : new CompositeLodSink(sinks);
+        LodSinks.set(sink);
+        return sink;
+    }
+
+    /**
+     * Returns the store root, {@code <world>/chunksmith/lod}. The backchannel serves this tree and nothing
+     * else, so it is the boundary every request path is canonicalized against.
+     */
+    public static Path storeRootBase(MinecraftServer server) {
+        return server.getWorldPath(LevelResource.ROOT).resolve("chunksmith").resolve("lod").normalize();
+    }
+
+    /**
+     * The id clients key their copy of this world's store on, or empty if we could not write one.
+     * Minted once and cached; see {@link com.kishku7.chunksmith.lod.CsLodWorldId} for why it is not
+     * the seed.
+     */
+    public static String worldId(MinecraftServer server) {
+        return CsLodWorldId.forStore(storeRootBase(server));
+    }
+
+    /** Returns our own tree, {@code <world>/chunksmith/lod/<dim>}; we never touch voxy's or DH's store. */
+    public static Path storeRoot(ServerLevel level) {
+        Path worldRoot = level.getServer().getWorldPath(LevelResource.ROOT);
+        return worldRoot.resolve("chunksmith").resolve("lod").resolve(dimensionKey(level)).normalize();
+    }
+
+    /**
+     * Returns the store directory name for a level, which is also the name that goes on the wire. That covers
+     * this server's store directory, the dimension field of the region index, the client's own store
+     * directory, and the key the client's injector checks the level against. Derived in one place so the two
+     * sides cannot disagree.
+     */
+    public static String dimensionKey(ServerLevel level) {
+        return dimensionId(level).replace(':', '_').replace('/', '_');
+    }
+
+    public static String dimensionId(ServerLevel level) {
+        //[[[cog
+        // import cog, compat
+        // cog.outl("return level.dimension().%s().toString();" % compat.dimension_identifier_call(mcver))
+        //]]]
+        //[[[end]]]
+    }
+
+    private static boolean hasStore(LodSink sink) {
+        for (LodSink leaf : leaves(sink)) {
+            if (leaf instanceof CsLodStoreSink) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<LodSink> leaves(LodSink sink) {
+        if (sink instanceof final CompositeLodSink composite) {
+            return composite.getSinks();
+        }
+        return List.of(sink);
+    }
+
+    /**
+     * Mod ids that mean "something in this JVM can draw an LOD". Read out of the published jars and fork
+     * sources themselves, not off a wiki:
+     * <ul>
+     *   <li>{@code distanthorizons}: all loaders, every MC line we ship LOD on.</li>
+     *   <li>{@code voxy}: upstream voxy and five of the six known forks (m3t4f1v3, j-shelfwood,
+     *       realBritakee, JustinTHChapman, NHblock714), every one of which keeps the upstream mod id.</li>
+     *   <li>{@code neovoxy}: the one fork that renamed itself (meansabine/neo-voxy).</li>
+     * </ul>
+     *
+     * <p>The list itself lives in {@link RendererNames}, with the human name for each, because this
+     * file and {@code ServerSideRendererError} had drifted to two different lists and two different
+     * vocabularies -- printed two lines apart in the same startup log.
+     */
+    private static final List<String> RENDERER_IDS = RendererNames.ids();
+
+    /** Resolved once: a mod cannot appear in the JVM halfway through a run. Null = none present. */
+    private static volatile String renderer;
+    private static volatile boolean rendererResolved;
+
+    private static final AtomicBoolean ANNOUNCED =
+            new AtomicBoolean();
+
+    private static String detectRenderer() {
+        if (!rendererResolved) {
+            synchronized (LodSupport.class) {
+                if (!rendererResolved) {
+                    String found = null;
+                    for (String id : RENDERER_IDS) {
+                        if (LodPlatform.isModLoaded(id)) {
+                            found = id;
+                            break;
+                        }
+                    }
+                    renderer = found;
+                    rendererResolved = true;
+                }
+            }
+        }
+        return renderer;
+    }
+
+    /**
+     * Resolves the tristate. It decides, it does not log; {@link #announce(MinecraftServer)} owns the one log
+     * line.
+     *
+     * <p>{@code auto} is on for a dedicated server even with no renderer installed, and that is deliberate:
+     * a dedicated server cannot run voxy (client-only) and does not need DH, yet it is precisely where the
+     * CSLOD store has to exist -- it is the thing connecting clients download. The cost is bounded, paid
+     * only during a pregen the operator started (~5.8 KB per chunk on disk), and one config line ends it.
+     *
+     * <p>The wall-clock cost was quoted here as ~16 percent until it was re-measured on a dedicated server
+     * on 2026-08-20. That date is the one thing that matters about the number: the measurement supersedes
+     * the old figure, and any claim about LOD cost older than it is stale. 36.1 cps with LOD on against
+     * 34.2 cps with it off over matched windows: no measurable difference, and the OFF run was slightly
+     * slower, which is terrain noise. Extraction runs on the server thread, and once dispatch width was
+     * raised the server thread stopped being the bottleneck: it profiled at ~10 percent utilised, with
+     * extraction 70 percent of that. Re-measure before putting a scary number back.
+     *
+     * @return true when the LOD store should be written for this run
+     */
+    public static boolean decide(final Config config,
+                                 final MinecraftServer server) {
+        if (config == null) {
+            return false;
+        }
+        switch (config.getLodMode()) {
+            case ON:
+                return true;
+            case OFF:
+                return false;
+            default:
+                return detectRenderer() != null || (server != null && server.isDedicatedServer());
+        }
+    }
+
+    /**
+     * Returns the live decision, or false when Chunksmith is not up yet.
+     *
+     * @return the live decision, or false when Chunksmith is not up yet
+     */
+    public static boolean lodEnabled(MinecraftServer server) {
+        // ChunksmithProvider.get() throws when unloaded, so gate on isLoaded() first.
+        if (!ChunksmithProvider.isLoaded()) {
+            return false;
+        }
+        Config config = ChunksmithProvider.get().getConfig();
+        // worldEnterLod (mod_support #37): may switch LOD work off while the world-enter pregen holds
+        // the world frozen. Live, so it lifts the moment the world is released.
+        if (WorldEnterFreeze.isFrozen()
+                && !WorldEnterLod.resolve(config.getWorldEnterLodMode(), detectRenderer() != null)) {
+            return false;
+        }
+        return decide(config, server);
+    }
+
+    /**
+     * Say, once, out loud, what was decided and why. Wired to server-started by {@code LodInit}; exactly
+     * one of these lines per server run, and it always says which way it went.
+     */
+    public static void announce(MinecraftServer server) {
+        if (!ANNOUNCED.compareAndSet(false, true)) {
+            return;
+        }
+        if (!ChunksmithProvider.isLoaded()) {
+            return;
+        }
+        Config config = ChunksmithProvider.get().getConfig();
+        LodMode mode = config.getLodMode();
+        String found = detectRenderer();
+        boolean on = decide(config, server);
+
+        if (mode != LodMode.AUTO) {
+            LOGGER.info("Chunksmith: LOD generation {} (lodEnabled={} set explicitly in the config{})",
+                    on ? "ON" : "off", mode == LodMode.ON ? "true" : "false",
+                    found == null ? "" : "; " + RendererNames.display(found) + " is installed");
+            return;
+        }
+        if (found != null) {
+            LOGGER.info("Chunksmith: detected {}, so LOD generation is auto-enabled. "
+                            + "Pregen will build the CSLOD store (~5 KB/chunk, measured 2026-10-12; it roughly HALVES pregen throughput, measured 2026-09-19). "
+                            + "Set lodEnabled=false in config/chunksmith/config.json, or run /cs set lodEnabled false, to turn it off.",
+                    RendererNames.display(found));
+        } else if (server != null && server.isDedicatedServer()) {
+            LOGGER.info("Chunksmith: LOD generation auto-enabled (dedicated server). No renderer runs "
+                    + "here, but the CSLOD store is what connecting clients download, so the store is "
+                    + "built (~5 KB/chunk, measured 2026-10-12; it roughly HALVES pregen throughput, measured 2026-09-19). "
+                    + "Set lodEnabled=false in config/chunksmith/config.json, or run /cs set lodEnabled false, to turn it off.");
+        } else {
+            LOGGER.info("Chunksmith: no LOD renderer detected (looked for {}); LOD generation off. "
+                    + "Install Distant Horizons or Voxy, or set lodEnabled=true to force it on.",
+                    String.join(", ", RendererNames.displayNames()));
+        }
+        announceWorldEnter(config, server, found, on);
+    }
+
+    /**
+     * One line on what worldEnterLod resolved to, and why. Single-player only: the world-enter pregen
+     * never runs on a dedicated server, so there the line would describe nothing.
+     */
+    private static void announceWorldEnter(Config config, MinecraftServer server, String found, boolean lodOn) {
+        if (server == null || server.isDedicatedServer()) {
+            return;
+        }
+        LodMode mode = config.getWorldEnterLodMode();
+        boolean build = WorldEnterLod.resolve(mode, found != null);
+        if (mode == LodMode.AUTO && found == null) {
+            // Named first, and on its own: with no renderer, lodEnabled=auto is off too, and "LOD is
+            // off, nothing to act on" would hide the reason, which is that nothing is installed.
+            LOGGER.info("Chunksmith: no LOD renderer is installed, so the world-enter pre-gen builds no LOD"
+                    + " data (worldEnterLod=auto -> off). Set worldEnterLod=on to build it anyway.");
+        } else if (!lodOn) {
+            LOGGER.info("Chunksmith: LOD generation is off, so the world-enter pre-gen builds no LOD data"
+                    + " (worldEnterLod={} has nothing to act on).", mode.name().toLowerCase(Locale.ROOT));
+        } else if (mode != LodMode.AUTO) {
+            LOGGER.info("Chunksmith: the world-enter pre-gen {} LOD data (worldEnterLod={} set explicitly;"
+                    + " auto would {}).", build ? "builds" : "does NOT build",
+                    mode.name().toLowerCase(Locale.ROOT),
+                    WorldEnterLod.resolve(LodMode.AUTO, found != null) ? "build it" : "not build it");
+        } else if (build) {
+            LOGGER.info("Chunksmith: {} is installed, so the world-enter pre-gen builds LOD data as it goes"
+                    + " (worldEnterLod=auto -> on; measured faster than leaving it to the renderer)."
+                    + " Set worldEnterLod=off to skip it.", RendererNames.display(found));
+        }
+    }
+
+    /** Returns a one-line summary for {@code /cslod status}. */
+    public static String describeDecision(MinecraftServer server) {
+        if (!ChunksmithProvider.isLoaded()) {
+            return "lod: unknown (chunksmith not loaded)";
+        }
+        Config config = ChunksmithProvider.get().getConfig();
+        String found = detectRenderer();
+        String why;
+        switch (config.getLodMode()) {
+            case ON:
+                why = "forced on";
+                break;
+            case OFF:
+                why = "forced off";
+                break;
+            default:
+                why = found != null ? "auto: " + found + " detected"
+                        : (server != null && server.isDedicatedServer())
+                                ? "auto: dedicated server"
+                                : "auto: no renderer";
+                break;
+        }
+        return "lod: " + (decide(config, server) ? "ON" : "off") + " (" + why + ")";
+    }
+}

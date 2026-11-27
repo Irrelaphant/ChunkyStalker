@@ -1,0 +1,977 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.net;
+
+import com.kishku7.chunksmith.ChunksmithProvider;
+import com.kishku7.chunksmith.lod.net.CsLodControl;
+import com.kishku7.chunksmith.lod.net.CsLodGrowth;
+import com.kishku7.chunksmith.lod.HorizonGuard;
+import com.kishku7.chunksmith.lod.LodSupport;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Server side of the Chunksmith LOD protocol.
+ *
+ * <p>The client pulls: it says hello (telling us which renderers it has), asks for a region index,
+ * works out what it is missing, and fetches it (over the HTTP backchannel when that is available,
+ * in-band when it is not). It can stop at any time; the server pushes nothing uninvited except two
+ * nudges that make the client ask again -- the store-ready hello and the growth summary
+ * ({@link CsLodGrowth}) -- and refuses a
+ * client with no renderer rather than burn bandwidth on terrain nobody can draw. Loader-blind: every
+ * wire call goes through {@link CsLodChannel}, the one per-loader/per-era seam (Fabric raw channel
+ * &lt;1.20.2, Fabric payload registry, NeoForge PayloadRegistrar, Forge SimpleChannel), while
+ * CsLodProtocol / CsLodMessages / CsLodTokens / CsLodHttpServer live in shared_common and never see
+ * a Minecraft type.
+ *
+ * <h2>Nothing in here reads a region file, and nothing in here touches a disk on the tick thread</h2>
+ *
+ * <p>Both were false in 3.1.0-beta-3, and together they took a live production server to 100% RAM
+ * and hung its shutdown for 67 minutes. {@code index()} ran on the server main thread and called a
+ * {@code hash()} that did {@code crc.update(Files.readAllBytes(file))} on every region file inside
+ * the client's radius: on a 340-region / 1567 MB store, 366.9 MB read and allocated per index
+ * request, every byte[] a G1-humongous allocation straight into old gen, and the client re-asks
+ * every five seconds while the player travels. ~73 MB/s of humongous garbage on the tick thread,
+ * competing with a pregen for the same disk, until {@code saveAllChunks} could not allocate. Three
+ * changes, load-bearing together: the freshness token is derived from (mtime, size) rather than the
+ * bytes ({@link CsLodRegionHash}), one {@code statx} per region, no reads; the scan runs off the
+ * main thread, which now takes only an immutable snapshot of who is asking, where they stand and
+ * what they can draw ({@link Request}); and the answer is bounded in bytes, because {@link
+ * CsLodIndexScan#MAX_REGIONS} alone is no bound: 4096 x 7 MB is ~28 GB.
+ *
+ * <p>Shared source; the canonical location is _codegen/cog_sources/lod. Edit only there: the
+ * per-cell copy under gen/ is overwritten by cog-gen on every build.
+ */
+public final class CsLodServerNet {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("Chunksmith");
+
+    /** Silences a repeated "index was capped" line per player; see CsLodCapNotice. */
+    private static final CsLodCapNotice CAP_NOTICE = new CsLodCapNotice();
+
+    /** Silences a repeated "nothing ever reached the backchannel" line per player. */
+    private static final CsLodReachNotice REACH_NOTICE = new CsLodReachNotice();
+
+    private static final CsLodTokens TOKENS = new CsLodTokens();
+
+    /** ~16k blocks: further than any LOD renderer draws, and it bounds the index we build. */
+    private static final int MAX_RADIUS_BLOCKS = 16384;
+
+    /**
+     * A wire dimension id is one store subdirectory name and nothing else. Validated exactly as the
+     * HTTP backchannel validates its own path component: the shape must match, and the resolved
+     * directory must still live inside the store, so a "." or ".." that slips the pattern is still
+     * caught by the containment check below (belt and suspenders, matching CsLodHttpServer.resolve).
+     */
+    private static final Pattern DIM_DIR = Pattern.compile("[a-z0-9_.-]{1,64}");
+
+    /** The radius each client's renderer is actually configured to draw, in blocks. */
+    private static final Map<UUID, Integer> RADIUS = new ConcurrentHashMap<>();
+
+    /** How far past that radius each client has been served, once it has everything inside it (#45). */
+    private static final CsLodBackfill BACKFILL = new CsLodBackfill();
+
+    /**
+     * Players who asked, can draw, and were told we had nothing -- yet. A player who joins before
+     * the operator runs the pregen used to be told "no data" once and then left to rot for the rest
+     * of the session, and since a pregen takes hours with players sitting through it, that was the
+     * ordinary case. Kept even though the periodic sync would eventually notice too: the sync only
+     * runs once a client is armed for a dimension, and a player who joined before there was anything
+     * to index has no index. This is the path that gets them their first one, in five seconds rather
+     * than five minutes.
+     */
+    private static final Set<UUID> WAITING = ConcurrentHashMap.newKeySet();
+
+    /** Dimensions each player has already been told about. Nobody is ever notified about the same one twice. */
+    private static final Map<UUID, Set<String>> ANNOUNCED =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Players whose hello we have already narrated, and the protocol each one speaks. The retries and
+     * token renewals are not news.
+     *
+     * <p>A map rather than a set since 4.0.0: the legacy {@code /cslod} stub has to tell a 3.x client
+     * from a 4.x one, and the version is only ever seen here, in the hello. Two parallel structures
+     * would be two things to keep in step.
+     */
+    private static final Map<UUID, Integer> GREETED = new ConcurrentHashMap<>();
+
+    /**
+     * Players with a scan already running. The tick thread no longer rate-limits the scan, so a
+     * client that spams index requests could otherwise queue an unbounded pile of work on the scan
+     * thread. One outstanding scan per player: a second request while the first is in flight is
+     * dropped rather than queued; the answer being computed is the answer to the new one too, and an
+     * honest client only ever has one in flight (it holds a busy latch). That bounds the queue at
+     * one entry per online player.
+     */
+    private static final Set<UUID> SCANNING = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Players who have taken an index from us this session: the ones a growth push can help. A player
+     * who never asked (no renderer, a mismatched protocol, still waiting for the store) is left alone;
+     * the store-ready notice is what wakes the waiting ones.
+     */
+    private static final Set<UUID> ARMED = ConcurrentHashMap.newKeySet();
+
+    /**
+     * How often the store watch looks at the disk, and it looks only while somebody is waiting on
+     * it. 100 ticks is five seconds; the check is one directory open per loaded dimension, stopping
+     * at the first region file it sees ({@link CsLodStoreScan}). On a server whose store was already
+     * there at join {@link #WAITING} is empty, so this costs one {@code isEmpty()} per tick and no
+     * filesystem call at all.
+     */
+    private static final int STORE_WATCH_TICKS = 100;
+
+    private static int sinceStoreWatch;
+
+    private static CsLodHttpServer http;
+    private static MinecraftServer server;
+
+    /**
+     * The one thread that is allowed to touch the store on behalf of a request. one thread, not a
+     * pool: a scan is a readdir plus a stat per in-range region (~86 syscalls and no file content at
+     * all for a 340-region store at a 4-region radius), so it is microseconds and there is nothing
+     * to parallelise. A single thread also means the store is never scanned concurrently with
+     * itself, and gives the work a natural queue of at most one entry per online player ({@link
+     * #SCANNING}). Daemon, so it can never hold a shutdown open; shut down in {@link
+     * #onServerStopped}.
+     */
+    private static volatile ExecutorService scanPool;
+
+    private CsLodServerNet() {
+    }
+
+    public static void register() {
+        CsLodChannel.register();
+    }
+
+    /** A token must never outlive the session that earned it. Called from the disconnect hook. */
+    public static void onDisconnect(UUID player) {
+        TOKENS.revoke(player);
+        CsLodInBandSender.forget(player);
+        REACH_NOTICE.forget(player);
+        CAP_NOTICE.forget(player);
+        RADIUS.remove(player);
+        BACKFILL.forget(player);
+        WAITING.remove(player);
+        ANNOUNCED.remove(player);
+        GREETED.remove(player);
+        SCANNING.remove(player);
+        ARMED.remove(player);
+        CsLodClientStats.clear(player);
+        INJECTION_LOGGED.remove(player);
+    }
+
+    /**
+     * Binds the backchannel once the server is up and its port is known. The bind happens whenever
+     * LOD is enabled, not only when a store already exists. A fresh server pregenerates after
+     * startup, so gating the bind on "the store is there" would mean the backchannel never came up
+     * until the next restart, with nothing to tell the operator why. An empty store simply 404s
+     * until data lands.
+     */
+    public static void onServerStarted(MinecraftServer current) {
+        server = current;
+        if (!LodSupport.lodEnabled(current)) {
+            LOGGER.info("Chunksmith: LOD is disabled; not serving LODs");
+            return;
+        }
+        Path root = LodSupport.storeRootBase(current);
+        try {
+            Files.createDirectories(root);
+        } catch (IOException e) {
+            LOGGER.warn("Chunksmith: cannot create the LOD store root " + root + ": " + e);
+            return;
+        }
+        scanPool = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "chunksmith-lod-scan");
+            thread.setDaemon(true);
+            return thread;
+        });
+        http = new CsLodHttpServer(root, TOKENS, CsLodServerNet::isOnline);
+        http.setNameResolver(CsLodServerNet::nameOfId);
+        // Same interface the game is bound to; the port is gamePort + 1 unless the operator named one
+        // (lodBackchannelPort); mod_support #19. A bind failure is not fatal: the client falls back in-band.
+        http.start(current.getLocalIp(), current.getPort(), configuredPort(), configuredBind());
+        // From here, `/cs set lodBackchannelPort` can move the listener without a restart.
+        CsLodControl.register(
+                CsLodServerNet::rebind,
+                current::getPort,
+                () -> http == null ? "backchannel: not running (in-band fallback)" : http.describe());
+    }
+
+    /**
+     * Returns the operator's chosen backchannel port, or 0 to derive it. 0 whenever the mod is not loaded.
+     *
+     * @return the configured port, or 0 to derive one
+     */
+    private static int configuredPort() {
+        // ChunksmithProvider.get() throws when unloaded, so gate on isLoaded() first.
+        return ChunksmithProvider.isLoaded()
+                ? ChunksmithProvider.get().getConfig().getLodBackchannelPort()
+                : 0;
+    }
+
+    /**
+     * Returns the operator's chosen bind address, or empty to follow the game. Empty whenever the
+     * mod is not loaded, which is the same "behave as before" answer {@link #configuredPort} gives.
+     */
+    private static String configuredBind() {
+        return ChunksmithProvider.isLoaded()
+                ? ChunksmithProvider.get().getConfig().getLodBackchannelBindAddress()
+                : "";
+    }
+
+    /**
+     * Returns the host to put in a hello, or empty to let the client use the address it connected
+     * to. Read per hello rather than cached, so a {@code /cs set lodBackchannelHost} is already in
+     * force for the re-advertisement that same command triggers.
+     */
+    private static String advertisedHost() {
+        return ChunksmithProvider.isLoaded()
+                ? ChunksmithProvider.get().getConfig().getLodBackchannelHost()
+                : "";
+    }
+
+    /**
+     * The id this player's client should key its store on. Goes through the player rather than a
+     * captured server reference because two of the three hello sites are inside a loop over players
+     * and the third has no server in scope; they are all the same server either way.
+     */
+    private static String worldIdOf(ServerPlayer player) {
+        // Via the level, not the player: Entity carries no getServer() on any line we build for.
+        MinecraftServer server = player.level().getServer();
+        return server == null ? "" : LodSupport.worldId(server);
+    }
+
+    /**
+     * Moves the backchannel to the currently configured port without a restart, after {@code /cs set
+     * lodBackchannelPort}. Three things must happen together or the change is worse than useless.
+     * The old listener stops (or the old port stays open and nothing has moved), the new one binds,
+     * and every connected client is told and re-issued a token; {@link CsLodHttpServer#stop()}
+     * clears the token table, so a client that is not re-greeted holds a credential the new listener
+     * will not honour and quietly 404s until it relogs. Main thread only, because it sends packets.
+     *
+     * @return the port now bound, or 0 if the backchannel is not running (in-band fallback)
+     */
+    public static int rebind() {
+        MinecraftServer current = server;
+        if (current == null) {
+            return 0;
+        }
+        if (http != null) {
+            http.stop();
+            http = null;
+        }
+        if (!LodSupport.lodEnabled(current)) {
+            return 0;
+        }
+        Path root = LodSupport.storeRootBase(current);
+        try {
+            Files.createDirectories(root);
+        } catch (IOException e) {
+            LOGGER.warn("Chunksmith: cannot create the LOD store root " + root + ": " + e);
+            return 0;
+        }
+        http = new CsLodHttpServer(root, TOKENS, CsLodServerNet::isOnline);
+        http.setNameResolver(CsLodServerNet::nameOfId);
+        int bound = http.start(current.getLocalIp(), current.getPort(), configuredPort(), configuredBind());
+        readvertise(current, bound);
+        return bound;
+    }
+
+    /**
+     * Re-send the hello to every client that has spoken the protocol, carrying the new port and a
+     * fresh token. Only GREETED players: a vanilla client would log an unknown id and drop it. A
+     * player whose send fails is left alone rather than retried; they re-hello on their next join,
+     * and the in-band channel keeps working meanwhile.
+     */
+    private static void readvertise(MinecraftServer current, int port) {
+        List<String> dims = dimensions();
+        boolean available = !dims.isEmpty();
+        int told = 0;
+        for (ServerPlayer player : current.getPlayerList().getPlayers()) {
+            if (!GREETED.containsKey(player.getUUID())) {
+                continue;
+            }
+            String token = (available && port != 0)
+                    ? TOKENS.issue(player.getUUID())
+                    : "";
+            try {
+                send(player, CsLodMessages.encode(new CsLodMessages.ServerHello(
+                        CsLodProtocol.VERSION, available, port, token, dims, advertisedHost(),
+                        worldIdOf(player))));
+                told++;
+            } catch (IOException e) {
+                LOGGER.warn("Chunksmith: could not tell {} about the new backchannel port: {}",
+                        nameOf(player), e.toString());
+            }
+        }
+        LOGGER.info("Chunksmith: LOD backchannel moved to port {}; {} connected client(s) re-issued"
+                + " a token. No relog needed.", port == 0 ? "none (in-band)" : String.valueOf(port), told);
+    }
+
+    public static void onServerStopped() {
+        // First: a rebind that fired after this point would resurrect a listener for a dying server.
+        CsLodControl.clear();
+        if (http != null) {
+            http.stop();
+            http = null;
+        }
+        ExecutorService current = scanPool;
+        if (current != null) {
+            // A scan holds no lock the shutdown needs and writes nothing, but we wait a moment anyway so a
+            // scan in flight is not interrupted mid-readdir into an otherwise clean shutdown.
+            current.shutdown();
+            try {
+                if (!current.awaitTermination(2, TimeUnit.SECONDS)) {
+                    current.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                current.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+            scanPool = null;
+        }
+        TOKENS.clear();
+        BACKFILL.clear();
+        WAITING.clear();
+        ANNOUNCED.clear();
+        GREETED.clear();
+        SCANNING.clear();
+        ARMED.clear();
+        CsLodClientStats.clearAll();
+        INJECTION_LOGGED.clear();
+        CsLodGrowth.reset();
+        sinceStoreWatch = 0;
+        server = null;
+    }
+
+    public static String describe() {
+        String inBand = CsLodInBandSender.pending() > 0
+                ? " | in-band backlog: " + CsLodInBandSender.pending() + " regions" : "";
+        return (http == null ? "LOD serving: in-band only (no backchannel)" : "LOD serving: " + http.describe())
+                + inBand;
+    }
+
+    /**
+     * Issues a backchannel token for an online player, out of band of the handshake, so an operator
+     * can mint a token and try the endpoint by hand. Op-gated, and still bound to that player's real
+     * address, so it grants nothing the player could not already get by connecting.
+     *
+     * @return the token, or null when the backchannel is not running
+     */
+    public static String issueFor(ServerPlayer player) {
+        if (http == null || http.getPort() == 0) {
+            return null;
+        }
+        return TOKENS.issue(player.getUUID());
+    }
+
+    private static boolean isOnline(UUID player) {
+        MinecraftServer current = server;
+        return current != null && current.getPlayerList().getPlayer(player) != null;
+    }
+
+    /** A connected player's name from their id, or null when they are not connected (the caller falls back). */
+    private static String nameOfId(UUID id) {
+        MinecraftServer current = server;
+        ServerPlayer found = current == null ? null : current.getPlayerList().getPlayer(id);
+        return found == null ? null : nameOf(found);
+    }
+
+    /**
+     * Handles one inbound protocol message. Always called on the server main thread by {@link CsLodChannel}.
+     */
+    public static void receive(ServerPlayer player, byte[] data) {
+        if (data.length == 0) {
+            return;
+        }
+        try (DataInputStream in = CsLodMessages.reader(data)) {
+            byte id = in.readByte();
+            switch (id) {
+                case CsLodProtocol.C2S_HELLO -> hello(player, CsLodMessages.decodeClientHello(in));
+                case CsLodProtocol.C2S_REQUEST_INDEX -> dispatch(player, in.readUTF(), false, false);
+                case CsLodProtocol.C2S_REQUEST_SUMMARY -> dispatch(player, in.readUTF(), true, true);
+                case CsLodProtocol.C2S_REQUEST_REGIONS -> inBand(player, in);
+                case CsLodProtocol.C2S_INJECTED -> injected(player, CsLodMessages.decodeInjectionReport(in));
+                case CsLodProtocol.C2S_CANCEL -> {
+                    CsLodInBandSender.cancel(player);
+                    LOGGER.debug("Chunksmith: LOD transfer cancelled by client");
+                }
+                default -> LOGGER.warn("Chunksmith: unknown LOD message id " + id);
+            }
+        } catch (IOException e) {
+            LOGGER.warn("Chunksmith: malformed LOD message from " + nameOf(player) + ": " + e);
+        }
+    }
+
+    /** When each player's last injection report was written to the console, so a flood cannot flood the log. */
+    private static final Map<UUID, Long> INJECTION_LOGGED = new ConcurrentHashMap<>();
+    private static final long INJECTION_LOG_MIN_GAP_MILLIS = 1_000L;
+
+    /**
+     * A client says it finished putting a batch of our LOD into its renderer. The only place the server can
+     * learn this; the console line is what an operator reads to answer "did it actually arrive".
+     */
+    private static void injected(ServerPlayer player, CsLodMessages.InjectionReport report) {
+        CsLodClientStats.addInjected(player.getUUID(), report.renderer(), report.chunks(), report.failed());
+        long now = System.currentTimeMillis();
+        Long last = INJECTION_LOGGED.get(player.getUUID());
+        if (last != null && now - last < INJECTION_LOG_MIN_GAP_MILLIS) {
+            return;
+        }
+        INJECTION_LOGGED.put(player.getUUID(), now);
+        LOGGER.info("Chunksmith: {} injected {} LOD chunk(s) into {}{}", nameOf(player), report.chunks(),
+                report.renderer(), report.failed() > 0 ? " (" + report.failed() + " failed)" : "");
+    }
+
+    private static void hello(ServerPlayer player, CsLodMessages.ClientHello hello) throws IOException {
+        if (hello.protocolVersion() != CsLodProtocol.VERSION) {
+            LOGGER.info("Chunksmith: " + nameOf(player) + " speaks LOD protocol v"
+                    + hello.protocolVersion() + ", we speak v" + CsLodProtocol.VERSION + ", so we are not serving."
+                    + " Their Chunksmith needs to match this server's.");
+            // Answer anyway, with our version and nothing else: a mismatched client that hears nothing
+            // back cannot tell "no Chunksmith here" from "will not talk to me". One 30-byte reply and the
+            // old client's own version check names the problem in their log. No token, no scan, no data.
+            send(player, CsLodMessages.encode(new CsLodMessages.ServerHello(
+                    CsLodProtocol.VERSION, false, 0, "", List.of())));
+            CsLodClientStats.onHello(player.getUUID(), hello.protocolVersion(), hello.hasVoxy(), hello.hasDh(),
+                    hello.radiusBlocks(), 0);
+            // RECORD THE GREETING EVEN THOUGH WE REFUSED TO SERVE. This is what tells the legacy
+            // /cslod stub that an OLD client is present, and it was missing: the stub could never
+            // fire for the only clients it exists for, so it was dead code. Found by running a
+            // 3.18.1 client against a 4.0.0 server -- no 4.x-only rig can see this.
+            GREETED.put(player.getUUID(), hello.protocolVersion());
+            // And re-send the command tree. Brigadier builds it ONCE at login, before this hello
+            // arrives, so requires() had already been evaluated with GREETED empty and the node
+            // dropped for the whole session. Re-sending re-evaluates it, and the client is told to
+            // update instead of getting "Unknown or incomplete command".
+            MinecraftServer owner = player.level().getServer();
+            if (owner != null) {
+                owner.getCommands().sendCommands(player);
+            }
+            return;
+        }
+        if (!hello.hasVoxy() && !hello.hasDh() && !hello.hasMap()) {
+            // No renderer, no DATA. Answer with an empty hello and stop before the store is even looked at:
+            // no token minted, no dimension list built, no radius recorded, and deliberately not added to
+            // WAITING, so storeWatchTick never wakes them with an offer they cannot accept.
+            send(player, CsLodMessages.encode(new CsLodMessages.ServerHello(
+                    CsLodProtocol.VERSION, false, 0, "", List.of())));
+            CsLodClientStats.onHello(player.getUUID(), hello.protocolVersion(), hello.hasVoxy(), hello.hasDh(),
+                    hello.radiusBlocks(), 0);
+            // But do record the greeting (3.4.0): GREETED is what hasLodClient() answers, which decides
+            // whether /cslod set relays to them. Leaving it out was why a player with Chunksmith and no
+            // renderer could not reach their own client settings at all. Guarded by add(): one line/session.
+            if (GREETED.put(player.getUUID(), hello.protocolVersion()) == null) {
+                LOGGER.info("Chunksmith: LOD hello from " + nameOf(player)
+                        + " (voxy=false dh=false map=false, no LOD renderer) -> serving no data;"
+                        + " /cslod set can reach them");
+            }
+            return;
+        }
+
+        List<String> dims = dimensions();
+        boolean available = !dims.isEmpty();
+        int port = http == null ? 0 : http.getPort();
+        CsLodClientStats.onHello(player.getUUID(), hello.protocolVersion(), hello.hasVoxy(), hello.hasDh(),
+                hello.radiusBlocks(), port);
+
+        // The token is issued on this connection, which Mojang has already authenticated: a UUID or a name
+        // proves nothing (both are public), but only a genuinely joined player can receive this, and only
+        // when there is something to serve. "The store directory exists" used to be enough, so a server
+        // minted a token the instant a pregen created the folder and before it wrote a single region: a
+        // credential to download nothing, and an operator reading "1 live token, 0 files".
+        String token = (available && port != 0)
+                ? TOKENS.issue(player.getUUID())
+                : "";
+
+        send(player, CsLodMessages.encode(new CsLodMessages.ServerHello(
+                CsLodProtocol.VERSION, available, port, token, dims, advertisedHost(),
+                worldIdOf(player))));
+
+        RADIUS.put(player.getUUID(),
+                Math.min(MAX_RADIUS_BLOCKS, Math.max(16, hello.radiusBlocks())));
+
+        if (available) {
+            WAITING.remove(player.getUUID());
+            ANNOUNCED.computeIfAbsent(player.getUUID(),
+                    ignored -> ConcurrentHashMap.newKeySet()).addAll(dims);
+        } else {
+            // Nothing for them yet. Remember them: the store usually fills up later in this very session.
+            WAITING.add(player.getUUID());
+        }
+
+        // The client re-asks on a backed-off clock and again to renew its token. Narrate only the first
+        // hello of a session: a line every fifteen seconds per waiting player is how a feature gets disabled.
+        String line = "Chunksmith: LOD hello from " + nameOf(player)
+                + " (voxy=" + hello.hasVoxy() + " dh=" + hello.hasDh() + " map=" + hello.hasMap() + " radius=" + hello.radiusBlocks()
+                + ") -> store=" + available + " backchannel=" + (port == 0 ? "none (in-band)" : port);
+        if (GREETED.put(player.getUUID(), hello.protocolVersion()) == null) {
+            LOGGER.info(line);
+        } else {
+            LOGGER.debug(line);
+        }
+    }
+
+    /**
+     * The fallback for when no backchannel port is open: drip the regions down the game connection
+     * instead, at a rate that leaves room for gameplay traffic.
+     */
+    private static void inBand(ServerPlayer player, DataInputStream in) throws IOException {
+        String requested = in.readUTF();
+        int count = in.readInt();
+        // Bound the count before sizing anything: it came off the wire (see CsLodIndexScan.MAX_REGIONS).
+        if (count < 0 || count > CsLodIndexScan.MAX_REGIONS) {
+            LOGGER.warn("Chunksmith: ignoring an in-band LOD request from {} for {} regions (max {})",
+                    nameOf(player), count, CsLodIndexScan.MAX_REGIONS);
+            return;
+        }
+        List<CsLodMessages.RegionEntry> wanted = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            wanted.add(new CsLodMessages.RegionEntry(in.readInt(), in.readInt(), 0L, 0L));
+        }
+        Path root = storeBase();
+        if (root == null) {
+            return;
+        }
+        // The dimension came off the wire and is about to build filesystem paths; validate + contain it.
+        if (safeDimensionDir(root, requested) == null) {
+            LOGGER.warn("Chunksmith: ignoring an in-band LOD request from {} for a malformed dimension id",
+                    nameOf(player));
+            return;
+        }
+        // Same rule as the index (see dispatch()): serve the dimension the player is in, whatever they
+        // asked for. The sender stamps it on every slice and the client files under the dimension it is told.
+        String dimension = dimensionOf(player);
+        if (dimension.isEmpty()) {
+            return;
+        }
+        if (!dimension.equals(requested)) {
+            LOGGER.info("Chunksmith: {} asked in-band for {} while standing in {}; serving {} instead.",
+                    nameOf(player), requested, dimension, dimension);
+        }
+        CsLodInBandSender.queue(player, root, dimension, wanted);
+        CsLodClientStats.addInBand(player.getUUID(), wanted.size());
+        LOGGER.info("Chunksmith: in-band LOD fetch for {}. {} regions of {} (no backchannel; this is the"
+                + " slow path)", nameOf(player), wanted.size(), dimension);
+        // An in-band fetch is the SYMPTOM. If the backchannel is bound and has never been reached at
+        // all, say so here rather than leaving the operator to infer it from counters they would have
+        // to know to go and read. Reported three times (mod_support #24, #26, #31) with the startup
+        // line already printing the port -- the line was not missing, it was at boot and at INFO.
+        CsLodHttpServer server = http;
+        // Port 0 means no backchannel was bound at all (a singleplayer world, or a refused port that
+        // already said why at startup). "Open TCP 0" is not advice anybody can take (mod_support #37).
+        if (server != null && server.getPort() > 0
+                && CsLodReachNotice.unreached(true, server.servedCount(), server.rejectedCount())
+                && REACH_NOTICE.shouldWarn(player.getUUID(), System.currentTimeMillis())) {
+            // true: the mod HAS an in-band fallback, so the consequence here is slowness.
+            LOGGER.warn(CsLodReachNotice.explain(server.getPort(), true));
+        }
+    }
+
+    /** Drip-feeds the in-band queues, and watches for the store coming to life. Wired to the server tick. */
+    public static void tick(MinecraftServer current) {
+        HorizonGuard.tick(current);
+        for (ServerPlayer player : current.getPlayerList().getPlayers()) {
+            CsLodInBandSender.tick(player);
+        }
+        storeWatchTick(current);
+        growthTick(current);
+    }
+
+    /**
+     * While a pregen fills the store, tell the players who already have an index that it grew, by
+     * sending the summary they would otherwise have waited up to a sync interval to ask for. Their
+     * client compares it with what it holds and fetches only the difference. {@link CsLodGrowth}
+     * decides when; a server with no pregen running pays one volatile read per tick.
+     */
+    private static void growthTick(MinecraftServer current) {
+        if (ARMED.isEmpty() || !CsLodGrowth.pushDue(System.currentTimeMillis())) {
+            return;
+        }
+        int pushed = 0;
+        for (UUID uuid : List.copyOf(ARMED)) {
+            ServerPlayer player = current.getPlayerList().getPlayer(uuid);
+            if (player == null) {
+                ARMED.remove(uuid);
+                continue;
+            }
+            String dimension = dimensionOf(player);
+            if (dimension.isEmpty()) {
+                continue;
+            }
+            try {
+                dispatch(player, dimension, true, false);
+                pushed++;
+            } catch (IOException e) {
+                LOGGER.debug("Chunksmith: growth push to {} failed: {}", nameOf(player), e.toString());
+            }
+        }
+        LOGGER.debug("Chunksmith: the LOD store grew; sent {} player(s) a fresh summary", pushed);
+    }
+
+    /**
+     * Tell the players who joined before the store existed, once it does. The client still pulls: we
+     * re-send the hello, the same message we answer a hello with, and the client decides for itself
+     * whether to ask for an index. Deliberately cheap and quiet, with no watcher thread, no {@code
+     * WatchService}, no filesystem poll at all unless a player is actually waiting (a normal server
+     * pays one {@code isEmpty()} per tick); at most one notice per player per dimension per session
+     * ({@link #ANNOUNCED}), so a pregen writing thousands of regions produces one message; and the
+     * player leaves {@link #WAITING} the moment they are told, so the watch goes back to sleep.
+     */
+    private static void storeWatchTick(MinecraftServer current) {
+        if (WAITING.isEmpty()) {
+            sinceStoreWatch = 0;
+            return;
+        }
+        if (++sinceStoreWatch < STORE_WATCH_TICKS) {
+            return;
+        }
+        sinceStoreWatch = 0;
+
+        List<String> dims = dimensions();
+        if (dims.isEmpty()) {
+            return;
+        }
+        int port = http == null ? 0 : http.getPort();
+
+        for (UUID uuid : List.copyOf(WAITING)) {
+            ServerPlayer player = current.getPlayerList().getPlayer(uuid);
+            if (player == null) {
+                WAITING.remove(uuid);
+                continue;
+            }
+            Set<String> told = ANNOUNCED.computeIfAbsent(uuid,
+                    ignored -> ConcurrentHashMap.newKeySet());
+            if (!told.addAll(dims)) {
+                // They already know about every dimension we can serve. Never say it twice.
+                WAITING.remove(uuid);
+                continue;
+            }
+            WAITING.remove(uuid);
+
+            String token = port != 0 ? TOKENS.issue(uuid) : "";
+            try {
+                send(player, CsLodMessages.encode(new CsLodMessages.ServerHello(
+                        CsLodProtocol.VERSION, true, port, token, dims, advertisedHost(),
+                        worldIdOf(player))));
+            } catch (IOException e) {
+                LOGGER.warn("Chunksmith: could not tell {} that the LOD store is ready: {}",
+                        nameOf(player), e.toString());
+                continue;
+            }
+            LOGGER.info("Chunksmith: the LOD store now has data for {}. Telling {}, who joined before it"
+                    + " existed. No relog needed.", dims, nameOf(player));
+        }
+    }
+
+    public static void sendTo(ServerPlayer player, byte[] data) {
+        send(player, data);
+    }
+
+    /**
+     * Checks whether this player's client has actually spoken the LOD protocol to us. The hello is
+     * the only signal that there is a Chunksmith on the other end, and it matters for {@code /cslod
+     * set}, because an unknown message id is logged and dropped at the far end silently, so without
+     * this check a player on a vanilla client would type a command and have no way to tell "it
+     * worked" from "nothing is listening". A renderer is not required to be greeted (3.4.0); the
+     * question is whether a Chunksmith is listening, not whether there is anything to draw with.
+     *
+     * @return true once we have heard a hello from this client
+     */
+    public static boolean hasLodClient(ServerPlayer player) {
+        return GREETED.containsKey(player.getUUID());
+    }
+
+    /**
+     * True when this player's client greeted us speaking a protocol older than ours.
+     *
+     * <p>The gate on the legacy {@code /cslod} stub. Deliberately requires a GREETING as well as an
+     * old version: a vanilla client never greets at all, and telling somebody with no Chunksmith
+     * installed to update their Chunksmith is worse than saying nothing.
+     */
+    public static boolean isLegacyClient(ServerPlayer player) {
+        Integer spoken = GREETED.get(player.getUUID());
+        return spoken != null && spoken < CsLodProtocol.VERSION;
+    }
+
+    /**
+     * Asks a player's client to list, show or set one of its own LOD settings. Main thread only,
+     * like every other send. The client prints the reply into its own chat; this side reports
+     * nothing about the outcome because it cannot know it. The file being written is on the player's
+     * machine.
+     *
+     * @return false if the message could not even be built, which is a bug rather than a user error
+     */
+    public static boolean sendClientSetting(final ServerPlayer player,
+                                            final byte action,
+                                            final String name,
+                                            final String value) {
+        try {
+            send(player, CsLodMessages.encode(new CsLodMessages.ClientSetting(action, name, value)));
+            return true;
+        } catch (IOException e) {
+            LOGGER.warn("Chunksmith: could not encode a client-setting message for {}: {}", nameOf(player), e.toString());
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------ index + summary
+
+    /**
+     * Everything the scan thread needs, captured on the main thread. This record is the thread
+     * boundary: a player's position, their level and the player object itself are all mutated by the
+     * tick, so we read them once synchronously on the tick and the scan thread then works from an
+     * immutable snapshot and never touches a game object again.
+     *
+     * @param summaryOnly true for a sync poll (fold the answer to two numbers), false for a full index
+     */
+    private record Request(UUID uuid, String name, String dimension, int px, int pz, int radius,
+                           boolean summaryOnly, boolean grown) {
+    }
+
+    /**
+     * Takes the snapshot, and hands the filesystem work to the scan thread. Always called on the
+     * server main thread; it is the last thing on the main thread this feature does, and everything
+     * here is O(1).
+     */
+    private static void dispatch(ServerPlayer player, String requested, boolean summaryOnly,
+                                 boolean clientPoll)
+            throws IOException {
+        Path root = storeBase();
+        if (root == null) {
+            return;
+        }
+        // The dimension came off the wire and is used to build a filesystem path; validate + contain it.
+        if (safeDimensionDir(root, requested) == null) {
+            LOGGER.warn("Chunksmith: ignoring a LOD request from {} for a malformed dimension id",
+                    nameOf(player));
+            return;
+        }
+
+        // An index is only meaningful for the dimension the player is standing in: it is filtered by the
+        // renderer's radius measured from their position, and a position is a position in a particular
+        // world. A 3.1.0-beta-2 client latched onto the first dimension we listed at join and never asked
+        // for another; we cannot patch a jar already in a player's mods folder, but we do not have to
+        // honour a request we know is wrong. Serve the dimension they are actually in, and echo which.
+        String dimension = dimensionOf(player);
+        if (dimension.isEmpty()) {
+            return;
+        }
+        if (!dimension.equals(requested)) {
+            LOGGER.info("Chunksmith: {} asked for the LOD index of {} while standing in {}, serving {}"
+                    + " instead.", nameOf(player), requested, dimension, dimension);
+        }
+
+        UUID uuid = player.getUUID();
+        if (!summaryOnly) {
+            ARMED.add(uuid);
+        }
+        // One scan per player at a time (see SCANNING): what keeps the scan queue bounded.
+        if (!SCANNING.add(uuid)) {
+            LOGGER.debug("Chunksmith: {} already has a LOD scan in flight; dropping the duplicate request",
+                    nameOf(player));
+            return;
+        }
+
+        int radius = RADIUS.getOrDefault(uuid, CsLodProtocol.DEFAULT_RADIUS_BLOCKS);
+        // Background send (#45): what the player draws is served first and unchanged; each idle poll after
+        // that widens the radius a step. Only a client's own poll widens it -- a growth push is not one.
+        int served = radius;
+        if (ChunksmithProvider.get().getConfig().isLodBackgroundSendEnabled()) {
+            served = (clientPoll && ARMED.contains(uuid))
+                    ? BACKFILL.advance(uuid, radius, MAX_RADIUS_BLOCKS)
+                    : BACKFILL.radius(uuid, radius);
+        }
+        Request request = new Request(uuid, nameOf(player), dimension,
+                (int) player.getX(), (int) player.getZ(), served,
+                summaryOnly, served > radius);
+
+        ExecutorService pool = scanPool;
+        if (pool == null) {
+            SCANNING.remove(uuid);
+            return;
+        }
+        try {
+            pool.execute(() -> run(root, request));
+        } catch (RejectedExecutionException e) {
+            // The server is stopping. Nothing to answer, and nothing to complain about.
+            SCANNING.remove(uuid);
+        }
+    }
+
+    /**
+     * Reads the dimension directory, stats the regions that are in range, and either sends the whole
+     * index or folds it to two numbers. The scan runs on the scan thread, never on the tick. Not one
+     * byte of any region file is read.
+     */
+    private static void run(Path root, Request request) {
+        try {
+            Path dir = safeDimensionDir(root, request.dimension());
+            if (dir == null) {
+                return;
+            }
+            long budgetMb = ChunksmithProvider.get().getConfig().getLodIndexBudgetMb();
+            CsLodIndexScan.Result scanned = CsLodIndexScan.scan(dir,
+                    new CsLodIndexScan.Request(request.dimension(), request.px(), request.pz(),
+                            request.radius(), budgetMb * 1024L * 1024L), System.currentTimeMillis());
+            // Throttled, because the client asks again every time the player has travelled half a
+            // region and warning per answer said "capped" six times in seventy-three seconds without
+            // anything being wrong. See CsLodCapNotice.
+            // Not for the background ring past what the player asked for: hitting the cap out there is the
+            // ring being large, not the player's own view being cut short.
+            if (scanned.capped() && !request.grown()
+                    && CAP_NOTICE.shouldWarn(request.uuid(), System.currentTimeMillis())) {
+                LOGGER.warn("Chunksmith: LOD index for {} capped at {} of {} regions ({} MB, radius"
+                                + " {}): {}",
+                        request.name(), scanned.regions().size(), scanned.found(),
+                        scanned.bytes() / (1024 * 1024), request.radius(),
+                        CsLodCapNotice.explain(scanned, budgetMb));
+            }
+            List<CsLodMessages.RegionEntry> regions = scanned.regions();
+
+            byte[] message;
+            if (request.summaryOnly()) {
+                message = CsLodMessages.encode(new CsLodMessages.RegionSummary(
+                        request.dimension(), regions.size(), CsLodIndexScan.aggregate(regions)));
+                LOGGER.debug("Chunksmith: LOD sync summary for {}, {} regions of {}",
+                        request.name(), regions.size(), request.dimension());
+            } else {
+                message = CsLodMessages.encode(new CsLodMessages.RegionIndex(request.dimension(), regions));
+            }
+
+            // Back to the main thread to send: the send is the one part of this that touches a live player
+            // object, and hopping back costs a queue entry and buys not reasoning about channel thread-safety.
+            MinecraftServer current = server;
+            if (current == null) {
+                return;
+            }
+            current.execute(() -> {
+                ServerPlayer player = current.getPlayerList().getPlayer(request.uuid());
+                if (player != null) {
+                    send(player, message);
+                }
+            });
+        } catch (IOException e) {
+            LOGGER.warn("Chunksmith: could not scan the LOD store for {}: {}", request.name(), e.toString());
+        } finally {
+            SCANNING.remove(request.uuid());
+        }
+    }
+
+    /**
+     * Resolves a wire dimension id to a directory inside the store, or null if it is malformed or
+     * tries to escape. Two gates, same as {@code CsLodHttpServer.resolve}. The shape must match
+     * {@link #DIM_DIR}, and the normalized result must still start with the store root (catching a
+     * "." / ".." the pattern would otherwise admit).
+     *
+     * @return the dimension directory, or null when the id is malformed or escapes the store
+     */
+    private static Path safeDimensionDir(Path root, String dimension) {
+        if (dimension == null || dimension.isEmpty() || !DIM_DIR.matcher(dimension).matches()) {
+            return null;
+        }
+        Path dir = root.resolve(dimension).normalize();
+        return dir.startsWith(root) ? dir : null;
+    }
+
+    /**
+     * Returns the dimensions we can actually serve, right now. A dimension directory is not LOD
+     * data. A pregen creates {@code chunksmith/lod/<dim>/} the instant it starts and writes no
+     * region into it for some time after, and advertising it then told clients we had a dimension we
+     * could not serve one byte of, and minted a backchannel token for it (see {@link #hello}).
+     * {@link CsLodStoreScan} stops at the first region file it finds.
+     *
+     * @return the dimension ids that hold at least one region file
+     */
+    private static List<String> dimensions() {
+        MinecraftServer current = server;
+        if (current == null) {
+            return List.of();
+        }
+        List<Path> dirs = new ArrayList<>();
+        for (ServerLevel level : current.getAllLevels()) {
+            dirs.add(LodSupport.storeRoot(level));
+        }
+        return CsLodStoreScan.servable(dirs, System.currentTimeMillis());
+    }
+
+    /**
+     * Returns the store key of the dimension the player is actually in. It is the authority for
+     * everything we serve them. Resolved by identity against the server's own levels, so it is the
+     * same string {@link LodSupport#storeRoot} named that dimension's directory with. The empty
+     * return is unreachable in practice; it exists so a caller can never get a plausible-looking
+     * wrong answer.
+     *
+     * @return the store key of the player's current dimension
+     */
+    private static String dimensionOf(ServerPlayer player) {
+        MinecraftServer current = server;
+        if (current == null) {
+            return "";
+        }
+        for (ServerLevel level : current.getAllLevels()) {
+            if (level == player.level()) {
+                return LodSupport.dimensionKey(level);
+            }
+        }
+        return "";
+    }
+
+    private static Path storeBase() {
+        MinecraftServer current = server;
+        return current == null ? null : LodSupport.storeRootBase(current);
+    }
+
+    /** The player's display name. authlib renamed GameProfile.getName() to name() at MC 1.21.9. */
+    private static String nameOf(ServerPlayer player) {
+        //[[[cog
+        // import cog, compat
+        // cog.outl("return player.getGameProfile().%s();" % compat.profile_name_call(mcver))
+        //]]]
+        //[[[end]]]
+    }
+
+    private static void send(ServerPlayer player, byte[] data) {
+        CsLodChannel.send(player, data);
+    }
+}

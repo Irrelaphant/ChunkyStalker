@@ -1,0 +1,122 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.iterator;
+
+import com.kishku7.chunksmith.Selection;
+import com.kishku7.chunksmith.util.ChunkCoordinate;
+
+import java.util.NoSuchElementException;
+
+public class ConcentricChunkIterator implements ChunkIterator {
+    private final int xCenter, zCenter;
+    private final int radiusChunks;
+    private final long total;
+    private int x, z;
+    private int annulus, span;
+    private int down, left, up, right;
+    private boolean hasNext = true;
+
+    public ConcentricChunkIterator(Selection selection, long count) {
+        this(selection);
+        if (count <= 0) {
+            return;
+        }
+        int diameterFinished = (int) Math.floor(Math.sqrt(count));
+        if (diameterFinished % 2 == 0) {
+            --diameterFinished;
+        }
+        this.annulus = diameterFinished / 2 + 1;
+        this.x += annulus;
+        this.z += annulus;
+        this.span = 2 * annulus;
+        long perimeterCount = count - ((long) diameterFinished * diameterFinished) + 1;
+        this.down += (int) Math.min(span, perimeterCount);
+        perimeterCount -= Math.min(span, perimeterCount);
+        this.left += (int) Math.min(span, perimeterCount);
+        perimeterCount -= Math.min(span, perimeterCount);
+        this.up += (int) Math.min(span, perimeterCount);
+        perimeterCount -= Math.min(span, perimeterCount);
+        this.right += (int) Math.min(span, perimeterCount);
+        this.x += right - left;
+        this.z += up - down;
+        if (annulus > radiusChunks) {
+            hasNext = false;
+        }
+    }
+
+    public ConcentricChunkIterator(Selection selection) {
+        this.radiusChunks = selection.radiusChunksX();
+        this.x = selection.centerChunkX();
+        this.z = selection.centerChunkZ();
+        this.xCenter = x;
+        this.zCenter = z;
+        long diameterChunks = selection.diameterChunksX();
+        this.total = diameterChunks * diameterChunks;
+    }
+
+    @Override
+    public boolean hasNext() {
+        return hasNext;
+    }
+
+    @Override
+    public ChunkCoordinate next() {
+        if (!hasNext) {
+            throw new NoSuchElementException();
+        }
+        ChunkCoordinate chunkCoord = new ChunkCoordinate(x, z);
+        if (x == xCenter + annulus && z == zCenter + annulus) {
+            ++annulus;
+            ++x;
+            ++z;
+            if (annulus > radiusChunks) {
+                hasNext = false;
+            }
+            span = 2 * annulus;
+            down = left = up = right = 0;
+        }
+        if (down < span) {
+            --z;
+            ++down;
+        } else if (left < span) {
+            --x;
+            ++left;
+        } else if (up < span) {
+            ++z;
+            ++up;
+        } else if (right < span) {
+            ++x;
+            ++right;
+        }
+        return chunkCoord;
+    }
+
+    @Override
+    public long total() {
+        return total;
+    }
+
+    @Override
+    public String name() {
+        return PatternType.CONCENTRIC;
+    }
+}

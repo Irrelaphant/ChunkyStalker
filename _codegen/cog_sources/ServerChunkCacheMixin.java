@@ -1,0 +1,77 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.mixin;
+
+import net.minecraft.server.level.ServerChunkCache;
+//[[[cog
+// import cog, compat
+// # ChunkResult (transitional+) vs Either + ChunkHolder (ancient) return-type imports.
+// for imp in compat.chunk_future_result_imports(mcver):
+//     cog.outl(imp)
+// # ProfilerFiller only needed for the 26-only broadcast invoker.
+// if compat.has_broadcast_changed_chunks(mcver):
+//     cog.outl("import net.minecraft.util.profiling.ProfilerFiller;")
+//]]]
+//[[[end]]]
+import net.minecraft.world.level.chunk.ChunkAccess;
+//[[[cog
+// import cog, compat
+// # ChunkStatus moved into the .status subpackage at 1.20.5.
+// cog.outl(compat.chunkstatus_import(mcver))
+//]]]
+//[[[end]]]
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.gen.Invoker;
+
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * COG DRIFT (drift matrix 2f): {@code getChunkFutureMainThread} returns
+ * {@code CompletableFuture<Either<ChunkAccess, ChunkHolder.ChunkLoadingFailure>>} on 1.20.1/1.20.4
+ * and {@code CompletableFuture<ChunkResult<ChunkAccess>>} from 1.20.5. A structural @Invoker binds
+ * by signature, so a reflection facade cannot help. 26 also exposes {@code broadcastChangedChunks}.
+ */
+@Mixin(ServerChunkCache.class)
+public interface ServerChunkCacheMixin {
+    //[[[cog
+    // import cog, compat
+    // cog.outl('    @SuppressWarnings("UnnecessaryModifier")')
+    // cog.outl('    @Invoker("getChunkFutureMainThread")')
+    // cog.outl('    public CompletableFuture<%s> invokeGetChunkFutureMainThread(final int chunkX,' % compat.chunk_future_result_type(mcver))
+    // cog.outl('                                                                                      final int chunkZ,')
+    // cog.outl('                                                                                      final ChunkStatus toStatus,')
+    // cog.outl('                                                                                      final boolean create);')
+    //]]]
+    //[[[end]]]
+
+    @Invoker
+    boolean invokeRunDistanceManagerUpdates();
+
+    //[[[cog
+    // import cog, compat
+    // if compat.has_broadcast_changed_chunks(mcver):
+    //     cog.outl("")
+    //     cog.outl("    @Invoker")
+    //     cog.outl("    void invokeBroadcastChangedChunks(ProfilerFiller arg);")
+    //]]]
+    //[[[end]]]
+}

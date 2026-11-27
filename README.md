@@ -1,0 +1,206 @@
+# ChunkyStalker
+
+**Pre-generate where your friends actually play -- overnight, while nobody is online.**
+
+ChunkyStalker is a fork of Chunksmith (itself derived from Chunky) for small friend-group modpack
+servers that don't have the RAM to pregenerate a whole world up front. It remembers where each
+player logged out and, during a nightly window (02:00-06:00 by default), pre-generates the area
+around each of those spots. Then the next session starts on ground that is already generated.
+
+Currently built and supported for **NeoForge 1.21.1** (the other NeoForge cells carry it too).
+Fabric, Forge and the Paper plugin still include the code, but nothing on those platforms reports
+logouts, so the feature is inactive there and `/cs stalker status` says so.
+
+### How it behaves
+
+- **Logout spots.** One spot per player: the latest logout, in whatever dimension it happened. If a
+  player logs out within 32 blocks of a spot that is already finished, nothing is queued again.
+- **Nightly window.** Spots run one at a time, most recent logout first. They use a `concentric`
+  pattern and a `circle` shape, so if the night runs out, the chunks nearest the spot are already done.
+  Chunks that already exist are skipped quickly, so overlapping friends cost little.
+- **Pauses when someone joins.** A login pauses the current spot straight away, and the end of the window
+  pauses it too. Progress is saved, and the spot resumes the next time it is allowed to run.
+- **Per-player radius and expiry.** The default radius is 1000 blocks, and each player can have their own.
+  Spots are forgotten after 14 days without a logout (`expiry 0` = never).
+- **Never touches your own pregens.** If a world has a task running, or a paused task of yours,
+  ChunkyStalker leaves that world alone until it is free.
+
+State lives in `config/chunksmith/stalker.json`. All settings are live, so no restart is needed.
+
+### Commands
+
+```
+/cs stalker status                     schedule, queue, current spot and progress
+/cs stalker list                       every recorded logout spot
+/cs stalker run                        work through the queue now (ignores window and players)
+/cs stalker stop                       pause and stay idle until the current window ends
+/cs stalker radius <player> <blocks|default>
+/cs stalker reset <player|all>         queue a spot again
+/cs stalker remove <player>            forget a player's spot
+/cs stalker set enabled <true|false>
+/cs stalker set start 02:00            window start (24-hour)
+/cs stalker set end 06:00              window end; may wrap midnight, e.g. 22:00-04:00
+/cs stalker set timezone America/New_York   or 'server' for the machine's own zone
+/cs stalker set radius 1500            default radius in blocks (2k works too)
+/cs stalker set expiry 14              days; 0 = never forget
+/cs stalker set pauseonjoin <true|false>
+/cs stalker set shape circle | pattern concentric
+```
+
+ChunkyStalker uses its own mod id (`chunkystalker`) and refuses to load next to stock Chunksmith,
+because the two ship the same classes.
+
+Everything below is the upstream Chunksmith documentation, and all of it still applies.
+
+---
+
+# Chunksmith
+
+**Pre-generate your world -- and see it.**
+
+Chunksmith generates chunks ahead of time so players never wait on worldgen. What makes it different
+is that the *same pass* also builds the distant-horizon data for Distant Horizons or voxy. One run,
+two results: a world that loads instantly, and a world you can see to the edge of.
+
+Originally derived from [Chunky](https://github.com/pop4959/Chunky) by pop4959; developed
+independently since. Everything Chunky did, Chunksmith still does.
+
+**[Full documentation is on the wiki](https://github.com/Kishku7/Chunksmith/wiki)** -- every
+setting, every command, and walkthroughs for pregenerating, trimming, and getting multiplayer LOD
+working.
+
+**[Report a bug or ask a question](https://github.com/Kishku7/mod_support/issues)**
+
+---
+
+## What Chunksmith adds
+
+### It builds your LOD data while it pregenerates
+
+No second pass. No re-reading region files. No separate LOD pregen afterwards. Install Distant
+Horizons or voxy, run a pregen, and the distant terrain is simply there.
+
+**It turns itself on.** If a renderer is installed, LOD generation is on. There is no config key to
+hunt for.
+
+**Already pregenerated?** Run the same pregen again. Chunksmith builds LODs from the chunks it
+already has -- it does not regenerate them, and it skips everything already done. Pregenerate today,
+install a renderer next month, lose nothing.
+
+**Multiplayer LOD, with no companion mod.** Players joining your server download the pregenerated LOD
+data and see the whole world at distance without ever having walked it. The same jar is both halves --
+server and client. The Paper/Spigot plugin serves it too, so a modded client against a plugin server
+works.
+
+**LOD without the disk (4.4.0).** `/cs horizon <radius>` pregenerates normally inside the radius and,
+past it, builds the LOD and throws the chunk away instead of saving it. A world that would have been
+hundreds of gigabytes keeps only the area people actually play in, and the distant terrain still shows
+-- in single-player and for every player who joins. Chunks a player goes near are always kept. Not
+available with Moonrise; on Paper, the fully generated chunks are dropped but some partly generated
+ones at the edges are still written.
+
+### It keeps generating while people are playing
+
+Most pregenerators make you choose between speed and a playable server. Chunksmith measures what it
+*adds* to tick time rather than steering on absolute tick time -- so a server already running hot for
+its own reasons doesn't throttle Chunksmith to nothing for load it didn't cause.
+
+Every online player shrinks the allowance further, so an empty server runs flat out and a busy one
+actively gives ground. If the server still can't sustain it, the run **pauses itself with a stated
+reason and resumes when things recover**. Your `/cs pause` always outranks it.
+
+### It is measurably faster
+
+`dispatchMaxConcurrent` controls how many chunk requests stay in flight, and it scales to your CPU
+instead of a fixed cap. On an 8-core dedicated server, raising it from the old fixed 50 to 200
+measured **+39% -- 31.6 to 43.9 chunks/sec**. Settable live.
+
+### Other mods' structures actually get built
+
+A pregenerator that drops each chunk the instant it's generated breaks every mod that reacts to "a
+new chunk appeared" and then builds on a later tick -- the ground is already gone by the time it
+looks. Measured with Millenaire on a 1.21.1 pregen: **309 placement attempts, 309 deferrals, zero
+villages.**
+
+Chunksmith holds each chunk until all eight neighbours exist, then releases it. Nothing here is
+mod-specific -- the rule is about chunks, so anything that builds on new land benefits.
+
+### It tells you when worldgen misbehaves
+
+Overreach detection and structure-fault attribution, so a broken worldgen mod is something you can
+identify rather than something you merely suffer.
+
+### Everything is live
+
+Every setting is readable and settable live -- no restart, no editing files, no server downtime.
+Server settings are `/cs set`; the ones that belong to your own client are `/csclient set`. That's a
+rule the project holds itself to, with a test that fails if a setting is added without a command for
+it.
+
+---
+
+## Everything Chunky did
+
+Flexible shapes (square, circle, diamond, triangle, star, and more), centred on coordinates, world
+spawn, or the world border. Multi-world. Live progress, rate, ETA and an optional boss bar. Pause,
+continue, cancel, and continue-on-restart. World trimming. A developer API for progress and
+completion events.
+
+---
+
+## Installing
+
+**Required on the server** -- or in single-player, where your own game *is* the server. The client
+install is **optional**.
+
+You only need it on the client for **multiplayer LOD**: to see pregenerated distant terrain on a
+server you haven't walked. Pre-generation alone needs nothing on the client.
+
+Ships as a **Fabric, Forge, and NeoForge mod** and a **Paper / Spigot plugin**. (Folia is not
+supported. From 4.0.0 the plugin will not load on Folia at all -- it no longer declares
+`folia-supported`, so Folia refuses it rather than running a platform nothing tests. An unverifiable
+claim is worse than an absent one.)
+
+**Server and client must run the same major version.** 4.0.0 changed the LOD wire protocol, and a
+mixed 3.x/4.x pair turns LOD off in both directions: the client will not fetch and the server will
+not serve. Everything else keeps working -- it is the distant terrain that stops arriving, and both
+sides say so plainly rather than failing strangely.
+
+Worth knowing before you update: **a launcher will offer 4.0.0 to anyone on 3.x**, so a client can be
+updated into that mismatch without the server being touched. Move both together.
+
+**Put the renderer on the client, and only on the client.** Distant Horizons and Voxy draw distant
+terrain, and only a client draws anything -- the server just ships the data. A renderer installed on
+a server is strongly discouraged and, from 3.18.1, **the server tells you so in red at startup**. It
+competes for the same CPU Chunksmith is pre-generating on and duplicates the LOD your players are
+already being sent; a server-side Distant Horizons also fills the console with
+`[SharedApi] No DH level provided ...` warnings. Nothing is gained. If LOD is misbehaving on your
+server, this is the first thing to check.
+
+Renderer support, per loader and Minecraft version, is on the
+**[Supported renderers](https://github.com/Kishku7/Chunksmith/wiki/Supported-Renderers)** page --
+including the voxy forks, and which mods Chunksmith refuses to load beside.
+
+## Quick start
+
+```
+/cs world <world>     # pick the world
+/cs spawn             # centre on spawn
+/cs radius 5000       # how far out
+/cs start             # go
+```
+
+`/cs progress` to watch it, `/cs pause` and `/cs continue` as needed. The
+[wiki](https://github.com/Kishku7/Chunksmith/wiki) has the rest.
+
+## Source
+
+[Kishku7/Chunksmith](https://github.com/Kishku7/Chunksmith) is the current source tree (the 5.x line); the build guide is
+`BUILDING.md`. Older lines are frozen on branches: the 4.x line on
+[`archive_v4`](https://github.com/Kishku7/Chunksmith/tree/archive_v4), the 3.x line on
+[`archive_v3`](https://github.com/Kishku7/Chunksmith/tree/archive_v3), and the 2.x line on
+[`archive_v2`](https://github.com/Kishku7/Chunksmith/tree/archive_v2).
+
+## License
+
+GPL-3.0-only. Original Chunky (c) pop4959. Chunksmith modifications (c) Kishku7.

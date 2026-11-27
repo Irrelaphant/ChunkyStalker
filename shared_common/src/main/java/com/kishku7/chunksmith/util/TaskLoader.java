@@ -1,0 +1,206 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.util;
+
+import com.kishku7.chunksmith.Chunksmith;
+import com.kishku7.chunksmith.GenerationTask;
+import com.kishku7.chunksmith.Selection;
+import com.kishku7.chunksmith.iterator.PatternType;
+import com.kishku7.chunksmith.platform.World;
+import com.kishku7.chunksmith.shape.ShapeType;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
+
+public final class TaskLoader {
+    private final Chunksmith chunky;
+    private final Path savePath;
+    private final Map<String, Properties> tasks = new ConcurrentHashMap<>();
+
+    public TaskLoader(Chunksmith chunky) {
+        this.chunky = chunky;
+        this.savePath = chunky.getConfig().getDirectory().resolve("tasks");
+        reload();
+    }
+
+    public void reload() {
+        try {
+            Files.createDirectories(savePath);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        try (final Stream<Path> taskWalker = Files.walk(savePath)) {
+            taskWalker.forEach(task -> {
+                if (task.getFileName().toString().endsWith(".properties")) {
+                    try (final InputStream input = Files.newInputStream(task)) {
+                        Properties properties = new Properties();
+                        properties.load(input);
+                        String world = properties.getProperty("world");
+                        if (world != null) {
+                            tasks.put(world, properties);
+                        }
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public Optional<GenerationTask> loadTask(World world) {
+        Properties task = tasks.get(world.getName());
+        if (task == null) {
+            return Optional.empty();
+        }
+        boolean cancelled = Input.tryBoolean(task.getProperty(TaskProperty.CANCELLED.key())).orElse(false);
+        double centerX = Input.tryDouble(task.getProperty(TaskProperty.CENTER_X.key())).orElse(Selection.DEFAULT_CENTER_X);
+        double centerZ = Input.tryDouble(task.getProperty(TaskProperty.CENTER_Z.key())).orElse(Selection.DEFAULT_CENTER_Z);
+        double radiusX = Input.tryDouble(task.getProperty(TaskProperty.RADIUS_X.key())).orElse(Selection.DEFAULT_RADIUS);
+        double radiusZ = Input.tryDouble(task.getProperty(TaskProperty.RADIUS_Z.key())).orElse(radiusX);
+        String pattern = task.getProperty(TaskProperty.PATTERN.key(), PatternType.REGION);
+        String file = task.getProperty(TaskProperty.CSV.key());
+        String shape = task.getProperty(TaskProperty.SHAPE.key(), ShapeType.SQUARE);
+        double horizon = Input.tryDouble(task.getProperty(TaskProperty.LOD_HORIZON.key())).orElse(0d);
+        Selection.Builder selection = Selection.builder(chunky, world)
+                .centerX(centerX)
+                .centerZ(centerZ)
+                .radiusX(radiusX)
+                .radiusZ(radiusZ)
+                .pattern(Parameter.of(pattern, file))
+                .shape(shape)
+                .horizon(horizon);
+        long chunks = Input.tryLong(task.getProperty(TaskProperty.CHUNKS.key())).orElse(0L);
+        long time = Input.tryLong(task.getProperty(TaskProperty.TIME.key())).orElse(0L);
+        return Optional.of(new GenerationTask(chunky, selection.build(), chunks, time, cancelled));
+    }
+
+    public List<GenerationTask> loadTasks() {
+        List<GenerationTask> generationTasks = new ArrayList<>();
+        for (World world : chunky.getServer().getWorlds()) {
+            loadTask(world).ifPresent(generationTasks::add);
+        }
+        return generationTasks;
+    }
+
+    public void saveTask(GenerationTask task) {
+        Selection selection = task.getSelection();
+        String world = selection.world().getName();
+        Properties properties = tasks.getOrDefault(world, new Properties());
+        properties.setProperty(TaskProperty.WORLD.key(), world);
+        properties.setProperty(TaskProperty.CANCELLED.key(), String.valueOf(task.isCancelled()));
+        properties.setProperty(TaskProperty.CENTER_X.key(), String.valueOf(selection.centerX()));
+        properties.setProperty(TaskProperty.CENTER_Z.key(), String.valueOf(selection.centerZ()));
+        properties.setProperty(TaskProperty.RADIUS_X.key(), String.valueOf(selection.radiusX()));
+        String shape = task.getShape().name();
+        if (ShapeType.RECTANGLE.equals(shape) || ShapeType.ELLIPSE.equals(shape)) {
+            properties.setProperty(TaskProperty.RADIUS_Z.key(), String.valueOf(selection.radiusZ()));
+        }
+        Parameter pattern = Parameter.of(task.getChunkIterator().name());
+        properties.setProperty(TaskProperty.PATTERN.key(), pattern.getType());
+        if (PatternType.CSV.equals(pattern.getType())) {
+            pattern.getValue().ifPresent(file -> properties.setProperty(TaskProperty.CSV.key(), file));
+        }
+        properties.setProperty(TaskProperty.SHAPE.key(), shape);
+        // The properties object is reused across tasks for a world, so a horizon that is now off must be
+        // removed, or a resumed task would quietly bring the last one back.
+        if (selection.horizon() > 0) {
+            properties.setProperty(TaskProperty.LOD_HORIZON.key(), String.valueOf(selection.horizon()));
+        } else {
+            properties.remove(TaskProperty.LOD_HORIZON.key());
+        }
+        properties.setProperty(TaskProperty.CHUNKS.key(), String.valueOf(task.getCount()));
+        properties.setProperty(TaskProperty.TIME.key(), String.valueOf(task.getTotalTime()));
+        tasks.put(world, properties);
+        writeTask(world, properties);
+    }
+
+    public void saveTasks() {
+        for (GenerationTask task : chunky.getGenerationTasks().values()) {
+            saveTask(task);
+        }
+    }
+
+    public void cancelTask(World world) {
+        loadTask(world).ifPresent(generationTask -> {
+            generationTask.stop(true);
+            saveTask(generationTask);
+        });
+    }
+
+    public void cancelTasks() {
+        loadTasks().forEach(generationTask -> cancelTask(generationTask.getSelection().world()));
+    }
+
+    private void writeTask(String world, Properties properties) {
+        StringBuilder propertiesBuilder = new StringBuilder();
+        for (TaskProperty taskProperty : TaskProperty.values()) {
+            String propertyValue = properties.getProperty(taskProperty.key());
+            if (propertyValue != null) {
+                propertiesBuilder.append(taskProperty.key()).append('=').append(propertyValue).append('\n');
+            }
+        }
+        String taskFileName = world.replace(':', '/') + ".properties";
+        Path taskPath = savePath.resolve(taskFileName);
+        try {
+            Files.createDirectories(taskPath.getParent());
+            Files.write(taskPath, propertiesBuilder.toString().getBytes());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private enum TaskProperty {
+        WORLD("world"),
+        CANCELLED("cancelled"),
+        CENTER_X("center-x"),
+        CENTER_Z("center-z"),
+        RADIUS_X("radius"),
+        RADIUS_Z("radius-z"),
+        SHAPE("shape"),
+        LOD_HORIZON("lod-horizon"),
+        PATTERN("pattern"),
+        CSV("csv"),
+        CHUNKS("chunks"),
+        TIME("time");
+
+        private final String key;
+
+        TaskProperty(String key) {
+            this.key = key;
+        }
+
+        public String key() {
+            return key;
+        }
+    }
+}

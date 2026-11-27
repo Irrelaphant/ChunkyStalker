@@ -1,0 +1,163 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod;
+
+import me.cortex.voxy.common.world.service.VoxelIngestService;
+import me.cortex.voxy.commonImpl.VoxyCommon;
+import net.minecraft.world.level.chunk.LevelChunk;
+
+import java.nio.file.Path;
+
+/**
+ * Compiled against voxy 0.2.16-beta; feeds freshly generated
+ * chunks into its ingest service. Hard-references voxy types,
+ * so it MUST NOT be class-loaded unless voxy is present
+ * ({@link LodSupport} gates that). Generated only where a
+ * voxy jar exists to compile against: Fabric 1.21.11 and
+ * Fabric 26.x; voxy is Fabric-only and upstream has never
+ * published a 1.20.1 or a 1.21.1 build, so on every other
+ * cell this class does not exist at all, a
+ * compile-time-absent seam. Singleplayer / integrated server
+ * only: voxy's instance factory is installed by VoxyClient,
+ * so on a dedicated server {@code VoxyCommon.getInstance()}
+ * is null and the streaming path handles that case instead.
+ *
+ * <p>voxy is forked constantly, and a fork that changed
+ * {@code tryAutoIngestChunk} would throw a {@code
+ * NoSuchMethodError} (an Error, straight through every {@code
+ * catch (Exception)} in the pregen pipeline) on the first
+ * chunk. So the sink absorbs a {@link LinkageError} once,
+ * says out loud what happened, and stands down for the
+ * session: the pregen keeps running and still writes the
+ * CSLOD store.
+ */
+public final class VoxyLodSink implements LodSink {
+
+    private static final String CAUSE_INCOMPATIBLE = "voxy-incompatible";
+
+    /**
+     * A LinkageError is structural -- the member is not in
+     * the jar that is loaded -- so it cannot heal, and
+     * retrying it per chunk would spam the log for a result
+     * that cannot change.
+     */
+    private volatile boolean broken;
+
+    /** This dimension's CSLOD store directory, for {@link LiveFeedLedger}. */
+    private final Path storeDir;
+
+    /**
+     * Whether voxy took the live chunk just offered. {@link LodSupport#offer} hands every sink the live
+     * chunk and then its extracted record, back to back on the main thread, so the record that follows
+     * is always this chunk's, and that is when the ledger is told.
+     */
+    private boolean lastFed;
+
+    public VoxyLodSink(Path storeDir) {
+        this.storeDir = storeDir;
+    }
+
+    /**
+     * Voxy's ingest gate requires the chunk's light to be
+     * real (sections must report LIGHT_AND_DATA). ChunkSmith
+     * generates at ChunkStatus.FULL, downstream of LIGHT, so
+     * the server light engine has already run and this holds.
+     */
+    @Override
+    public boolean offer(Object chunk) {
+        if (chunk instanceof final CsLodChunk record) {
+            // The store is getting this chunk. Write down whether voxy got it too.
+            LiveFeedLedger.touch(storeDir, record.getChunkX(), record.getChunkZ(), lastFed);
+            return true;
+        }
+        lastFed = false;
+        if (broken) {
+            // Accept and drop: the pregen must not stall on a renderer we have already ruled out.
+            return true;
+        }
+        if (!(chunk instanceof final LevelChunk levelChunk)) {
+            return true;
+        }
+        try {
+            if (VoxyCommon.getInstance() == null) {
+                // No engine (dedicated server, or voxy not initialized for this world): refusing here
+                // would stall pregen forever.
+                return true;
+            }
+            lastFed = VoxelIngestService.tryAutoIngestChunk(levelChunk);
+            return lastFed;
+        } catch (LinkageError error) {
+            standDown(error);
+            return true;
+        }
+    }
+
+    @Override
+    public int queueDepth() {
+        if (broken) {
+            return 0;
+        }
+        try {
+            var instance = VoxyCommon.getInstance();
+            if (instance == null) {
+                return 0;
+            }
+            return instance.getIngestService().getTaskCount();
+        } catch (LinkageError error) {
+            standDown(error);
+            return 0;
+        }
+    }
+
+    /**
+     * True while chunks offered here really reach voxy: not stood down, and voxy has an engine. The
+     * engine exists from client login (voxy starts its session in {@code ClientPacketListener.handleLogin})
+     * until logout, so a world-enter pregen is fed for all but the seconds before the player logs in.
+     */
+    @Override
+    public boolean feedsRendererDirectly() {
+        if (broken) {
+            return false;
+        }
+        try {
+            return VoxyCommon.getInstance() != null;
+        } catch (LinkageError error) {
+            standDown(error);
+            return false;
+        }
+    }
+
+    private void standDown(LinkageError error) {
+        broken = true;
+        LodWarnings.once(CAUSE_INCOMPATIBLE,
+                "voxy is installed, but this build of it does not match the voxy Chunksmith was built"
+                        + " against (" + error + "). Chunksmith will keep generating and will keep writing"
+                        + " its own LOD store, but it can no longer feed voxy directly. Distant terrain"
+                        + " will not appear in voxy while you generate. This normally means a voxy fork that"
+                        + " changed a method or a field. Please report it, with your voxy version.");
+    }
+
+    @Override
+    public String toString() {
+        return "VoxyLodSink" + (broken ? " (stood down -- incompatible voxy)" : "");
+    }
+}

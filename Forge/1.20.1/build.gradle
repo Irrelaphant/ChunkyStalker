@@ -1,0 +1,163 @@
+// ChunkSmith Forge cell -- ANCIENT classic Forge (LexForge) variant, MC 1.20.1.
+//
+// Standalone LexForge jar built with ForgeGradle 6 (FG6) + the SpongePowered Mixin gradle plugin on
+// JDK 17. Unlike the transitional/modern Forge cells (1.20.6+), 1.20.1 Forge runs an SRG (obfuscated)
+// runtime, so the mixin classes MUST ship a refmap (chunksmith.refmap.json) that maps the mojmap
+// dev-time @Inject/@Redirect/@Accessor/@Invoker target names to their SRG runtime names. The refmap is
+// produced by the SpongePowered mixin annotation processor (org.spongepowered:mixin:0.8.5:processor),
+// wired via the org.spongepowered.mixin gradle plugin's mixin{} block. This is the same proven
+// toolchain the old-branch 1.20.1 Forge cell used (and the other 1.20.1 Forge/NeoForge mods here).
+//
+// On 1.20.1 "NeoForge" is the project's first release: net.neoforged:forge:1.20.1-47.x still uses the
+// net.minecraftforge.* API namespace, so this cell is built against net.minecraftforge:forge:1.20.1-47.x
+// and is binary-compatible with both. JDK 17, official Mojang mappings at dev time.
+//
+// Single-cross-version-source model (Goal 5): compiles the Cog-generated output
+// (gen/, produced by cog-gen.ps1 -Loader Forge, which KEEPS the refmap key for this ancient cell) plus
+// the per-cell platform/entrypoint seam, and pulls MC-agnostic code from :chunksmith-common
+// (= ../../shared_common). Version drift in the shared mixins is resolved by Cog. -Xlint:all + zero warnings.
+
+plugins {
+    id 'eclipse'
+    id 'java'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'org.spongepowered.mixin' version '0.7.+'
+}
+
+allprojects {
+    group = project.findProperty('group')
+    version = project.findProperty('version')
+    repositories {
+        mavenCentral()
+    }
+}
+
+version = project.findProperty('version')
+group = project.findProperty('group')
+base { archivesName = project.findProperty('artifactName') }
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+// Ensure the plain-Java shared_common subproject gets the java-library plugin + JDK 17 toolchain.
+project(':chunksmith-common') {
+    apply plugin: 'java-library'
+    java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+repositories {
+    maven { url = 'https://maven.minecraftforge.net/' }
+    maven { url = 'https://repo.spongepowered.org/repository/maven-public/' }
+}
+
+minecraft {
+    mappings channel: 'official', version: project.findProperty('minecraft_version')
+    copyIdeResources = true
+}
+
+// The SpongePowered mixin gradle plugin generates chunksmith.refmap.json from the mixin classes in
+// gen/ and registers the mixin config for reobfuscation into the SRG runtime.
+mixin {
+    add sourceSets.main, 'chunksmith.refmap.json'
+    config 'chunksmith.mixins.json'
+}
+
+configurations {
+    shade
+    implementation.extendsFrom shade
+}
+
+// Cog-generated source (produced by cog-gen.ps1 from _codegen/cog_sources for this MC version).
+sourceSets.main.java.srcDir 'gen/src/main/java'
+
+repositories {
+    // The Modrinth maven -- the ONLY place DH's standalone API artifact is published.
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${project.findProperty('forge_version')}"
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+
+    // Distant Horizons -- the LOD renderer this cell feeds in SINGLEPLAYER. OPTIONAL soft dependency:
+    // compiled against, NEVER shipped (LGPL-3; not ours to redistribute). The jar lives in the gitignored
+    // ../../libs/. Everything we touch is com.seibel.* and names no Minecraft type, so the jar needs no
+    // remap/reobf -- a plain compileOnly file dependency, which FG6 never touches.
+    //
+    // DH ships FORGE on the 1.20.1 line (there is no NeoForge 1.20.1 DH). No voxy here: voxy is
+    // Fabric-only and has never published a 1.20.1 build (checked against its published jars).
+    // Distant Horizons -- compiled against its STANDALONE API artifact, not the DH mod jar.
+    //
+    // DH publishes its API as a separate, MINECRAFT-AGNOSTIC artifact on the Modrinth maven: ONE 344 KB
+    // jar covers every MC version and every loader, replacing the four 28 MB per-MC-line mod jars this
+    // build used to pin. DH's own DhApi.READ_ME says to do exactly this -- "use the API jar in your build
+    // script as a compile time dependency and the full DH jar as a runtime dependency".
+    //
+    // Chunksmith uses DH's PUBLIC API only here (the one mixin lives in the LOD client half), so it
+    // needs NO full DH mod jar at compile time AT ALL. Everything we touch (DhApi.Delayed.terrainRepo,
+    // DhApiLevelLoadEvent, IDhApiLevelWrapper, DhApiChunk, DhApiResult, IDhApiWorldGenerator) is in the
+    // API artifact and names no Minecraft type, so there is nothing to remap on any loader.
+    //
+    // Every API method we call has been signature-stable since DH 2.0.0-a across six API-major bumps, so
+    // this ONE artifact honestly covers the whole wide DH range we claim. compileOnly and never shipped:
+    // DH is an optional soft dependency and is LGPL.
+    compileOnly 'maven.modrinth:distanthorizonsapi:7.0.0'
+    // The FULL DH jar -- COMPILE-TIME ONLY, and needed for exactly one thing: the LOD client's
+    // dedupe-gate mixin targets DH's INTERNAL DhClientLevel, which the API artifact above does not
+    // carry. Never shipped (DH is LGPL); DH stays an OPTIONAL soft dep at runtime. DH names no
+    // Minecraft type, so this one jar serves every cell -- nothing to remap, no per-MC pin.
+    compileOnly files("../../libs/DistantHorizons-3.2.0-b-1.21.1.jar")
+
+    implementation project(':chunksmith-common')
+    shade project(':chunksmith-common')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+    // Forge @Mod/@SubscribeEvent are consumed at bytecode/runtime, not by an annotation processor, and
+    // the mixin AP does not claim javac lint categories, so the ,-processing token suppresses the
+    // spurious "No processor claimed any of these annotations" warning while every other lint stays on.
+    // It is ONE -Xlint token (a lint-category disable), not a separate flag.
+    options.compilerArgs.add('-Xlint:all,-processing,-classfile')
+}
+
+processResources {
+    def expandProps = [
+        'github'     : project.findProperty('github'),
+        'id'         : project.findProperty('modId'),
+        'version'    : project.findProperty('version'),
+        'name'       : project.findProperty('artifactName'),
+        'author'     : project.findProperty('author'),
+        'description': project.findProperty('description')
+    ]
+    inputs.properties(expandProps)
+    filesMatching('META-INF/mods.toml') {
+        expand(expandProps)
+    }
+}
+
+jar {
+    dependsOn ':chunksmith-common:jar'
+    // Merge the shared common library classes into the mod jar before reobf.
+    from {
+        configurations.shade.collect { it.isDirectory() ? it : zipTree(it) }
+    } {
+        exclude 'META-INF/MANIFEST.MF'
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes([
+            'Implementation-Title'  : 'chunksmith',
+            'Implementation-Version': project.version,
+            'Implementation-Vendor' : project.findProperty('author'),
+            'MixinConfigs'          : 'chunksmith.mixins.json'
+        ])
+    }
+    archiveFileName = "${project.findProperty('artifactName')}-Forge-${project.findProperty('minecraft_version')}-${project.version}.jar"
+}

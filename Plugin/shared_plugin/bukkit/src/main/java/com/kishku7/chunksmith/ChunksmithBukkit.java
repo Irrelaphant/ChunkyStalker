@@ -1,0 +1,277 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith;
+
+import org.bstats.bukkit.Metrics;
+import org.bstats.charts.SimplePie;
+import org.bukkit.Bukkit;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.HandlerList;
+import org.bukkit.event.Listener;
+import org.bukkit.event.world.WorldInitEvent;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.ServicePriority;
+import org.bukkit.plugin.java.JavaPlugin;
+import com.kishku7.chunksmith.api.ChunksmithAPI;
+import com.kishku7.chunksmith.command.ChunksmithCommand;
+import com.kishku7.chunksmith.command.CommandArguments;
+import com.kishku7.chunksmith.command.CommandLiteral;
+import com.kishku7.chunksmith.lod.CsLodBukkitCommand;
+import com.kishku7.chunksmith.diagnostic.WorldgenOverreachLogFilter;
+import com.kishku7.chunksmith.integration.WorldBorderIntegration;
+import com.kishku7.chunksmith.platform.BukkitConfig;
+import com.kishku7.chunksmith.platform.BukkitPlayer;
+import com.kishku7.chunksmith.platform.BukkitSender;
+import com.kishku7.chunksmith.platform.BukkitServer;
+import com.kishku7.chunksmith.platform.Folia;
+import com.kishku7.chunksmith.platform.Paper;
+import com.kishku7.chunksmith.platform.Sender;
+import com.kishku7.chunksmith.util.Input;
+import com.kishku7.chunksmith.util.TranslationKey;
+import com.kishku7.chunksmith.util.Version;
+import com.kishku7.chunksmith.util.StructureFaultReporter;
+import com.kishku7.chunksmith.util.WorldgenOverreachReporter;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+
+import static com.kishku7.chunksmith.util.Translator.translate;
+import org.bukkit.event.player.PlayerQuitEvent;
+import com.kishku7.chunksmith.lod.CsLodServerBukkit;
+import com.kishku7.chunksmith.lod.ExploredLodBukkit;
+import com.kishku7.chunksmith.lod.LodHorizonBukkit;
+import com.kishku7.chunksmith.lod.LodSupport;
+
+public final class ChunksmithBukkit extends JavaPlugin implements Listener {
+    private static final String COMMAND_PERMISSION_KEY = "chunksmith.command.";
+    private static final String LEGACY_COMMAND_PERMISSION_KEY = "chunksmith.command.";
+    private Chunksmith chunky;
+    private WorldgenOverreachLogFilter overreachFilter;
+
+    @Override
+    public void onEnable() {
+        Plugin existingChunky = getServer().getPluginManager().getPlugin("Chunksmith");
+        if (existingChunky != null && existingChunky != this) {
+            getLogger().warning("Chunksmith supersedes Chunksmith. Disabling the Chunksmith plugin - please remove its jar from the plugins folder.");
+            getServer().getPluginManager().disablePlugin(existingChunky);
+        }
+        File legacyData = new File(getDataFolder().getParentFile(), "Chunksmith");
+        if (!getDataFolder().exists() && legacyData.isDirectory()) {
+            if (legacyData.renameTo(getDataFolder())) {
+                getLogger().info("Migrated existing Chunksmith data folder to Chunksmith.");
+            } else {
+                getLogger().warning("Could not migrate the Chunksmith data folder to Chunksmith.");
+            }
+        }
+        this.chunky = new Chunksmith(new BukkitServer(this), new BukkitConfig(this));
+        Version currentVersion = new Version(Bukkit.getBukkitVersion(), true);
+        if (currentVersion.isValid() && Version.MINECRAFT_1_13_2.isHigherThan(currentVersion)) {
+            getLogger().severe(() -> translate(TranslationKey.ERROR_VERSION));
+            getServer().getPluginManager().disablePlugin(this);
+        }
+        if (!isEnabled()) {
+            return;
+        }
+        getServer().getServicesManager().register(Chunksmith.class, chunky, this, ServicePriority.Normal);
+        getServer().getServicesManager().register(ChunksmithAPI.class, chunky.getApi(), this, ServicePriority.Normal);
+        if (chunky.getConfig().getContinueOnRestart()) {
+            Runnable continueTask = () -> chunky.getCommands().get(CommandLiteral.CONTINUE).execute(chunky.getServer().getConsole(), CommandArguments.empty());
+            if (Folia.isFolia()) {
+                Folia.onServerInit(this, continueTask);
+            } else {
+                getServer().getScheduler().scheduleSyncDelayedTask(this, continueTask);
+            }
+        }
+        if (getServer().getPluginManager().getPlugin("WorldBorder") != null) {
+            chunky.getServer().getIntegrations().put("border", new WorldBorderIntegration());
+        }
+        Metrics metrics = new Metrics(this, 8211);
+        metrics.addCustomChart(new SimplePie("language", () -> chunky.getConfig().getLanguage()));
+        getServer().getPluginManager().registerEvents(this, this);
+        if (!Paper.isPaper()) {
+            disablePauseWhenEmptySeconds();
+        }
+        installOverreachDiagnostic();
+        LodSupport.announce(chunky.getConfig());
+        // Connect the LOD serving path. Everything it needs has shipped in this jar since
+        // 3.2.0; nothing ever started it (mod_support #18).
+        CsLodServerBukkit.enable(this, chunky.getConfig());
+        LodHorizonBukkit.enable(this, chunky.getConfig());
+        ExploredLodBukkit.enable(this, chunky.getConfig());
+    }
+
+    @Override
+    public void onDisable() {
+        HandlerList.unregisterAll((Plugin) this);
+        if (overreachFilter != null) {
+            overreachFilter.uninstall();
+            overreachFilter = null;
+        }
+        if (chunky != null) {
+            CsLodServerBukkit.disable();
+            LodHorizonBukkit.disable();
+            ExploredLodBukkit.disable();
+        LodSupport.shutdown();
+            chunky.disable();
+        }
+    }
+
+    /**
+     * Install the best-effort worldgen-overreach diagnostic. There is no Mixin on a
+     * Bukkit server, so a Log4j2 filter captures + suppresses vanilla's "Detected
+     * setBlock in a far chunk" spam and routes it to {@link WorldgenOverreachReporter},
+     * which collapses each burst into a single aggregated line. A once-per-second
+     * scheduler tick drives the reporter's debounce/rollup/end-of-run summary. Both the
+     * filter and the tick fail soft - the diagnostic never interferes with generation or
+     * normal logging.
+     */
+    private void installOverreachDiagnostic() {
+        StructureFaultReporter.get().setReportFile(getDataFolder().toPath().resolve("worldgen-faults.txt"));
+        this.overreachFilter = WorldgenOverreachLogFilter.install();
+        if (this.overreachFilter == null) {
+            getLogger().info("Worldgen overreach diagnostic unavailable here (non-Log4j2 logging); continuing without it.");
+        }
+        Runnable tick = () -> {
+            boolean wgRunning = chunky != null && !chunky.getGenerationTasks().isEmpty();
+            WorldgenOverreachReporter.get().tick(wgRunning);
+            StructureFaultReporter.get().tick(wgRunning);
+        };
+        if (Folia.isFolia()) {
+            Folia.scheduleFixedGlobal(this, tick, 20L, 20L);
+        } else {
+            getServer().getScheduler().runTaskTimer(this, tick, 20L, 20L);
+        }
+    }
+
+    // Canonical permission namespace is chunksmith.command.*; the pre-rename chunky.command.* nodes
+    // are still honoured so existing server permission setups keep working after the rename.
+    private static boolean hasCommandPermission(CommandSender sender, String name) {
+        return sender.hasPermission(COMMAND_PERMISSION_KEY + name)
+                || sender.hasPermission(LEGACY_COMMAND_PERMISSION_KEY + name);
+    }
+
+    @SuppressWarnings("NullableProblems")
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        Sender bukkitSender = sender instanceof final Player player ? new BukkitPlayer(player) : new BukkitSender(sender);
+        if (CommandLiteral.CHUNKY.equalsIgnoreCase(label) || CommandLiteral.CY.equalsIgnoreCase(label)) {
+            bukkitSender.sendMessagePrefixed(TranslationKey.COMMAND_DEPRECATED_ALIAS);
+        }
+        // `lod` is checked BEFORE the shared map, which is what keeps the LOD feature out of the
+        // TranslationKey-wired command tree. The mod does the equivalent by grafting a brigadier
+        // literal onto its own root; brigadier prefers a literal child over the root's dispatcher,
+        // and this if is the Bukkit spelling of that.
+        if (args.length > 0 && CsLodBukkitCommand.LITERAL.equalsIgnoreCase(args[0])) {
+            if (!hasCommandPermission(sender, CommandLiteral.STATUS)) {
+                bukkitSender.sendMessage(TranslationKey.COMMAND_NO_PERMISSION);
+                return true;
+            }
+            CsLodBukkitCommand.execute(bukkitSender, Arrays.copyOfRange(args, 1, args.length));
+            return true;
+        }
+        Map<String, ChunksmithCommand> commands = chunky.getCommands();
+        CommandArguments arguments = CommandArguments.of(Arrays.copyOfRange(args, Math.min(1, args.length), args.length));
+        if (args.length > 0 && commands.containsKey(args[0].toLowerCase())) {
+            if (hasCommandPermission(sender, args[0].toLowerCase())) {
+                commands.get(args[0].toLowerCase()).execute(bukkitSender, arguments);
+            } else {
+                bukkitSender.sendMessage(TranslationKey.COMMAND_NO_PERMISSION);
+            }
+        } else {
+            commands.get(CommandLiteral.HELP).execute(bukkitSender, arguments);
+        }
+        return true;
+    }
+
+    @SuppressWarnings("NullableProblems")
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (args.length < 1) {
+            return List.of();
+        }
+        List<String> suggestions = new ArrayList<>();
+        Map<String, ChunksmithCommand> commands = chunky.getCommands();
+        if (args.length == 1) {
+            commands.keySet().stream().filter(name -> hasCommandPermission(sender, name)).forEach(suggestions::add);
+            if (hasCommandPermission(sender, CommandLiteral.STATUS)) {
+                suggestions.add(CsLodBukkitCommand.LITERAL);
+            }
+        } else if (CsLodBukkitCommand.LITERAL.equalsIgnoreCase(args[0])
+                && hasCommandPermission(sender, CommandLiteral.STATUS)) {
+            suggestions.addAll(CsLodBukkitCommand.suggestions(Arrays.copyOfRange(args, 1, args.length)));
+        } else if (commands.containsKey(args[0].toLowerCase()) && hasCommandPermission(sender, args[0].toLowerCase())) {
+            CommandArguments arguments = CommandArguments.of(Arrays.copyOfRange(args, 1, args.length));
+            suggestions.addAll(commands.get(args[0].toLowerCase()).suggestions(arguments));
+        }
+        return suggestions.stream()
+                .filter(s -> s.toLowerCase().contains(args[args.length - 1].toLowerCase()))
+                .toList();
+    }
+
+    public Chunksmith getChunky() {
+        return chunky;
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        // A LOD download token is bound to one session. It must not outlive it.
+        CsLodServerBukkit.onQuit(event.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
+    public void onWorldInit(WorldInitEvent event) {
+        chunky.getRegionCache().clear(event.getWorld().getName());
+    }
+
+    private void disablePauseWhenEmptySeconds() {
+        Path serverPropertiesPath = Path.of(".").resolve("server.properties");
+        File serverPropertiesFile = serverPropertiesPath.toFile();
+        Properties serverProperties = new Properties();
+        try (final FileInputStream serverPropertiesFileInputStream = new FileInputStream(serverPropertiesFile)) {
+            serverProperties.load(serverPropertiesFileInputStream);
+            Optional<Integer> pauseWhenEmptySeconds = Input.tryInteger(serverProperties.getProperty("pause-when-empty-seconds"));
+            if (pauseWhenEmptySeconds.isPresent() && pauseWhenEmptySeconds.get() > 0) {
+                serverProperties.setProperty("pause-when-empty-seconds", "0");
+                try (final FileOutputStream serverPropertiesFileOutputStream = new FileOutputStream(serverPropertiesFile)) {
+                    serverProperties.store(serverPropertiesFileOutputStream, "Minecraft server properties");
+                    getLogger().warning(() -> translate(TranslationKey.ERROR_PAUSE_WHEN_EMPTY_SECONDS));
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}

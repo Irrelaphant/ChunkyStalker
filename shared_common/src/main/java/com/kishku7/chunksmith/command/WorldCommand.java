@@ -1,0 +1,66 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.command;
+
+import com.kishku7.chunksmith.Chunksmith;
+import com.kishku7.chunksmith.platform.Player;
+import com.kishku7.chunksmith.platform.Sender;
+import com.kishku7.chunksmith.platform.World;
+import com.kishku7.chunksmith.util.Input;
+import com.kishku7.chunksmith.util.TranslationKey;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class WorldCommand implements ChunksmithCommand {
+    private final Chunksmith chunky;
+
+    public WorldCommand(Chunksmith chunky) {
+        this.chunky = chunky;
+    }
+
+    @Override
+    public void execute(Sender sender, CommandArguments arguments) {
+        final World world;
+        if (arguments.size() == 0 && sender instanceof final Player player) {
+            world = player.getWorld();
+        } else {
+            world = Input.tryWorld(chunky, arguments.joined()).orElse(null);
+        }
+        if (world == null) {
+            sender.sendMessage(TranslationKey.HELP_WORLD);
+            return;
+        }
+        chunky.getSelection().world(world);
+        sender.sendMessagePrefixed(TranslationKey.FORMAT_WORLD, world.getName());
+    }
+
+    @Override
+    public List<String> suggestions(CommandArguments arguments) {
+        if (arguments.size() == 1) {
+            final List<String> suggestions = new ArrayList<>();
+            chunky.getServer().getWorlds().forEach(world -> suggestions.add(world.getName()));
+            return suggestions;
+        }
+        return List.of();
+    }
+}

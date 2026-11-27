@@ -1,0 +1,182 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.net;
+
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.util.List;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * Tests for the store-availability transition that answers "is there anything here to serve?".
+ *
+ * <p>Worth pinning down because every wrong answer here is silent, and two of them have already shipped.
+ *
+ * <ul>
+ *   <li>A false "yes, the directory is there" is what the old code gave: a pregen creates the dimension
+ * directory the moment it starts, the server advertised it before
+ * a single region was written, minted a backchannel token for it,
+ * and the client downloaded nothing -- the "1 live token, 0 files"
+ * report.</li>
+ *   <li>A false "yes, that region is ready" is the one this fix nearly introduced: the store keeps region
+ * files OPEN and appends to them, so a region served mid-write has
+ * header slots pointing past the end of the bytes the client
+ * receives. It recovers, but it eats an EOF and gets a fraction of
+ * the region.</li>
+ *   <li>And a false "no" is the whole bug: the client is told there is no data, stands down, and never asks
+ *       again for the rest of the session.</li>
+ * </ul>
+ *
+ * <p>So: a dimension is servable when it contains a region the writer has finished with.
+ *
+ * <p>The clock is passed in, so "ten seconds later" costs nothing to test.
+ */
+public class CsLodStoreScanTest {
+
+    @Rule
+    public final TemporaryFolder temp = new TemporaryFolder();
+
+    /** A moment comfortably past the settle window for anything written "now". */
+    private static long settled() {
+        return System.currentTimeMillis() + CsLodStoreScan.SETTLE_MILLIS * 10L;
+    }
+
+    @Test
+    public void aMissingDirectoryIsNotServable() {
+        assertFalse(CsLodStoreScan.hasData(temp.getRoot().toPath().resolve("nope"), settled()));
+    }
+
+    @Test
+    public void nullIsNotServable() {
+        assertFalse(CsLodStoreScan.hasData(null, settled()));
+    }
+
+    @Test
+    public void aFileIsNotADimensionDirectory() throws IOException {
+        assertFalse(CsLodStoreScan.hasData(temp.newFile("minecraft_overworld").toPath(), settled()));
+    }
+
+    @Test
+    public void emptyIsNotServable() throws IOException {
+        Path dir = temp.newFolder("minecraft_overworld").toPath();
+        assertTrue(Files.isDirectory(dir));
+        assertFalse("an empty store directory",
+                CsLodStoreScan.hasData(dir, settled()));
+    }
+
+    @Test
+    public void aPartialRegionIsNotServable() throws IOException {
+        Path dir = temp.newFolder("minecraft_overworld").toPath();
+        Files.write(dir.resolve("r.0.0.cslod.part"), new byte[]{1, 2, 3});
+        Files.write(dir.resolve("readme.txt"), new byte[]{1});
+        assertFalse(CsLodStoreScan.hasData(dir, settled()));
+    }
+
+    @Test
+    public void anUnsettledRegionIsNotServable() throws IOException {
+        Path dir = temp.newFolder("minecraft_overworld").toPath();
+        Path region = dir.resolve("r.0.0.cslod");
+        Files.write(region, new byte[]{1, 2, 3});
+
+        long justWritten = Files.getLastModifiedTime(region).toMillis();
+
+        assertFalse("a region touched a moment ago",
+                CsLodStoreScan.isSettled(region, justWritten));
+        assertFalse(CsLodStoreScan.isSettled(region, justWritten + CsLodStoreScan.SETTLE_MILLIS - 1));
+        assertFalse(CsLodStoreScan.hasData(dir, justWritten));
+
+        // ...and the moment the writer has left it alone long enough, it is.
+        assertTrue(CsLodStoreScan.isSettled(region, justWritten + CsLodStoreScan.SETTLE_MILLIS));
+        assertTrue(CsLodStoreScan.hasData(dir, justWritten + CsLodStoreScan.SETTLE_MILLIS));
+    }
+
+    @Test
+    public void oneRegionIsEnough() throws IOException {
+        Path dir = temp.newFolder("minecraft_overworld").toPath();
+        assertFalse(CsLodStoreScan.hasData(dir, settled()));
+
+        Files.write(dir.resolve("r.0.0.cslod"), new byte[]{1, 2, 3});
+
+        assertTrue("first settled region",
+                CsLodStoreScan.hasData(dir, settled()));
+    }
+
+    @Test
+    public void servableNamesWhatIsFinished() throws IOException {
+        Path overworld = temp.newFolder("minecraft_overworld").toPath();
+        Path nether = temp.newFolder("minecraft_the_nether").toPath();
+        Path end = temp.newFolder("minecraft_the_end").toPath();
+
+        Files.write(overworld.resolve("r.0.0.cslod"), new byte[]{1});
+        Files.write(end.resolve("r.-1.4.cslod"), new byte[]{1});
+        // nether: directory made by the pregen, nothing written yet.
+
+        assertEquals(List.of("minecraft_overworld", "minecraft_the_end"),
+                CsLodStoreScan.servable(List.of(overworld, nether, end), settled()));
+    }
+
+    @Test
+    public void servableSkipsAnUnsettledDimension() throws IOException {
+        Path overworld = temp.newFolder("minecraft_overworld").toPath();
+        Path region = overworld.resolve("r.0.0.cslod");
+        Files.write(region, new byte[]{1});
+        long justWritten = Files.getLastModifiedTime(region).toMillis();
+
+        assertTrue(CsLodStoreScan.servable(List.of(overworld), justWritten).isEmpty());
+        assertEquals(List.of("minecraft_overworld"),
+                CsLodStoreScan.servable(List.of(overworld), justWritten + CsLodStoreScan.SETTLE_MILLIS));
+    }
+
+    @Test
+    public void aRewrittenRegionGoesHotAgain() throws IOException {
+        Path dir = temp.newFolder("minecraft_overworld").toPath();
+        Path region = dir.resolve("r.0.0.cslod");
+        Files.write(region, new byte[]{1});
+
+        long oldWrite = System.currentTimeMillis() - CsLodStoreScan.SETTLE_MILLIS * 5L;
+        Files.setLastModifiedTime(region, FileTime.fromMillis(oldWrite));
+        assertTrue(CsLodStoreScan.hasData(dir, System.currentTimeMillis()));
+
+        // The pregen touches it again.
+        long now = System.currentTimeMillis();
+        Files.setLastModifiedTime(region, FileTime.fromMillis(now));
+        assertFalse(CsLodStoreScan.hasData(dir, now));
+        assertTrue(CsLodStoreScan.hasData(dir, now + CsLodStoreScan.SETTLE_MILLIS));
+    }
+
+    @Test
+    public void servableIsEmpty() throws IOException {
+        Path overworld = temp.newFolder("minecraft_overworld").toPath();
+        assertTrue(CsLodStoreScan.servable(List.of(overworld), settled()).isEmpty());
+        assertTrue(CsLodStoreScan.servable(List.of(), settled()).isEmpty());
+        assertTrue(CsLodStoreScan.servable(null, settled()).isEmpty());
+    }
+}

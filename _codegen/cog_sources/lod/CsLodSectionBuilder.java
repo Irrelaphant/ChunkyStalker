@@ -1,0 +1,178 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod;
+
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import net.minecraft.commands.arguments.blocks.BlockStateParser;
+import net.minecraft.core.Holder;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainer;
+//[[[cog
+// import cog, compat
+// for line in compat.section_builder_imports(mcver):
+//     cog.outl(line)
+//]]]
+//[[[end]]]
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Rebuilds vanilla objects from stored CSLOD records by inverting Chunksmith's extractor.
+ *
+ * <p>Takes a {@link Level}, not a {@code ServerLevel}: on a client the world is a {@code ClientLevel}, and
+ * this is the whole reason this class exists separately from the server-side one.
+ *
+ * <p>Palette strings are resolved once each and cached: a chunk's palette has tens of entries, but a store
+ * has millions of voxels.
+ *
+ * <p><b>This is the file MC churn hits hardest,</b> and every drifting symbol in it is emitted by
+ * {@code compat.py}:
+ * <ul>
+ *   <li>the paletted containers. Below 1.21.11 you build them by hand
+ *       ({@code new PalettedContainer<>(IdMap, default, Strategy.SECTION_STATES)}); from 1.21.11 the
+ *       {@code Strategy} constants are gone and {@code PalettedContainerFactory} makes them for you. The
+ *       two-arg {@code LevelChunkSection(states, biomes)} constructor is the one thing stable across the
+ *       whole range, so that is what everything funnels into;</li>
+ *   <li>{@code RegistryAccess.registryOrThrow} -&gt; {@code lookupOrThrow} (1.21.11);</li>
+ *   <li>{@code Registry.getHolder}/{@code getHolderOrThrow} -&gt; {@code get}/{@code getOrThrow} (1.21.11);</li>
+ *   <li>{@code ResourceLocation} -&gt; {@code Identifier} (1.21.11), and the fact that the
+ *       {@code (String,String)} constructor is public only on 1.20.1.</li>
+ * </ul>
+ * A {@code Registry} is only itself a {@code HolderLookup} from 1.21.11; before that
+ * {@code BlockStateParser.parseForBlock} needs {@code .asLookup()}, which is why the block lookup is
+ * emitted too rather than shared.
+ */
+public final class CsLodSectionBuilder {
+
+    private static final Map<String, BlockState> BLOCK_CACHE = new HashMap<>();
+    private static final Map<String, Holder<Biome>> BIOME_CACHE = new HashMap<>();
+
+    private CsLodSectionBuilder() {
+    }
+
+    /** Rebuilds one section. The (states, biomes) constructor recalculates the block counts for us. */
+    //[[[cog
+    // import cog, compat
+    // dep = compat.deprecation_suppression(mcver, loader)
+    // if dep:
+    //     cog.outl(dep)
+    //]]]
+    //[[[end]]]
+    public static LevelChunkSection rebuild(final Level level,
+                                            final CsLodChunk record,
+                                            final CsLodChunk.Section section) {
+        //[[[cog
+        // import cog, compat
+        // for line in compat.palette_containers(mcver):
+        //     cog.outl(line)
+        //]]]
+        //[[[end]]]
+
+        if (section.getUniformBlock() >= 0) {
+            BlockState state = blockState(level, record.getBlockPalette().get(section.getUniformBlock()));
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        states.set(x, y, z, state);
+                    }
+                }
+            }
+        } else {
+            int[] indices = section.getBlocks();
+            int n = 0;
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        states.set(x, y, z, blockState(level, record.getBlockPalette().get(indices[n++])));
+                    }
+                }
+            }
+        }
+
+        if (section.getUniformBiome() >= 0) {
+            Holder<Biome> biome = biome(level, record.getBiomePalette().get(section.getUniformBiome()));
+            for (int y = 0; y < 4; y++) {
+                for (int z = 0; z < 4; z++) {
+                    for (int x = 0; x < 4; x++) {
+                        biomes.set(x, y, z, biome);
+                    }
+                }
+            }
+        } else {
+            int[] indices = section.getBiomes();
+            int n = 0;
+            for (int y = 0; y < 4; y++) {
+                for (int z = 0; z < 4; z++) {
+                    for (int x = 0; x < 4; x++) {
+                        biomes.set(x, y, z, biome(level, record.getBiomePalette().get(indices[n++])));
+                    }
+                }
+            }
+        }
+
+        return new LevelChunkSection(states, biomes);
+    }
+
+    /**
+     * Parses a block STATE string into a BlockState. Unknown block (a mod was removed since pregen) -> air.
+     */
+    public static BlockState blockState(Level level, String value) {
+        return BLOCK_CACHE.computeIfAbsent(value, key -> {
+            try {
+                //[[[cog
+                // import cog, compat
+                // cog.outl(compat.block_lookup_expr(mcver))
+                //]]]
+                //[[[end]]]
+            } catch (CommandSyntaxException e) {
+                return Blocks.AIR.defaultBlockState();
+            }
+        });
+    }
+
+    /** Biome id -> Holder. Unknown biome -> plains. */
+    //[[[cog
+    // import cog, compat
+    // sup = compat.removal_suppression(mcver, loader)
+    // if sup:
+    //     cog.outl(sup)
+    //]]]
+    //[[[end]]]
+    public static Holder<Biome> biome(Level level, String value) {
+        return BIOME_CACHE.computeIfAbsent(value, key -> {
+            //[[[cog
+            // import cog, compat
+            // for line in compat.biome_lookup_body(mcver):
+            //     cog.outl(line)
+            //]]]
+            //[[[end]]]
+        });
+    }
+}

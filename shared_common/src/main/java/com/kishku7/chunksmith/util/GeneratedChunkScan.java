@@ -1,0 +1,142 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.util;
+
+import com.kishku7.chunksmith.nbt.StringTag;
+import com.kishku7.chunksmith.nbt.TagType;
+import com.kishku7.chunksmith.nbt.util.Chunk;
+import com.kishku7.chunksmith.nbt.util.ChunkFilter;
+import com.kishku7.chunksmith.nbt.util.RegionFile;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * {@link RegionCache.WorldState} is an in-memory bitmap and
+ * it starts cold: {@code setGenerated} is only called for
+ * chunks this run generated. So on the run that matters
+ * (restart the server, re-run a selection over ground you
+ * already pregenerated) every chunk falls through to the
+ * per-chunk asynchronous {@code world.isChunkGenerated} call,
+ * taking a dispatch slot and riding the throttle just to be
+ * told "already there". Measured on a 5929-chunk selection
+ * that was 100 percent already generated: about seven seconds
+ * to decide there was nothing to do. That is linear, so a
+ * resumed hundred-thousand-chunk selection spends MINUTES
+ * learning what a handful of file headers would have said
+ * (mod_support #17).
+ */
+public final class GeneratedChunkScan {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("Chunksmith");
+
+    private GeneratedChunkScan() {
+    }
+
+    public static long seed(final Path regionDirectory,
+                            final RegionCache.WorldState state,
+                            final int minChunkX, final int minChunkZ,
+                            final int maxChunkX, final int maxChunkZ) {
+        File dir = regionDirectory.toFile();
+        File[] files = dir.listFiles((d, name) -> name.startsWith("r.") && name.endsWith(".mca"));
+        if (files == null || files.length == 0) {
+            return 0L;
+        }
+
+        int minRegionX = minChunkX >> 5;
+        int minRegionZ = minChunkZ >> 5;
+        int maxRegionX = maxChunkX >> 5;
+        int maxRegionZ = maxChunkZ >> 5;
+
+        long seeded = 0L;
+        int scanned = 0;
+        int unreadable = 0;
+
+        for (File file : files) {
+            int[] coords = regionCoordinates(file.getName());
+            if (coords == null) {
+                continue;
+            }
+            if (coords[0] < minRegionX || coords[0] > maxRegionX
+                    || coords[1] < minRegionZ || coords[1] > maxRegionZ) {
+                continue;   // wholly outside the selection: never opened
+            }
+            try {
+                RegionFile region = new RegionFile(file, ChunkFilter.of(TagType.STRING, "Status"));
+                scanned++;
+                for (Chunk chunk : region.getChunks()) {
+                    int cx = chunk.getX();
+                    int cz = chunk.getZ();
+                    if (cx < minChunkX || cx > maxChunkX || cz < minChunkZ || cz > maxChunkZ) {
+                        continue;
+                    }
+                    if (isFull(chunk)) {
+                        state.setGenerated(cx, cz);
+                        seeded++;
+                    }
+                }
+            } catch (Throwable t) {
+                // Deliberately Throwable: the region reader throws UnsupportedOperationException on a
+                // compression scheme it does not know, and unseeded just means "decide it the slow way".
+                unreadable++;
+            }
+        }
+
+        if (unreadable > 0) {
+            LOGGER.info("Chunksmith: pre-scan read " + scanned + " region file(s), " + unreadable
+                    + " unreadable (those chunks will be checked individually as before)");
+        }
+        return seeded;
+    }
+
+    private static int[] regionCoordinates(String name) {
+        int end = name.indexOf(".mca");
+        if (end < 2) {
+            return null;
+        }
+        String middle = name.substring(2, end);
+        int dot = middle.indexOf('.');
+        if (dot < 1) {
+            return null;
+        }
+        try {
+            return new int[]{
+                    Integer.parseInt(middle.substring(0, dot)),
+                    Integer.parseInt(middle.substring(dot + 1))
+            };
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static boolean isFull(Chunk chunk) {
+        return Optional.ofNullable(chunk.getData())
+                .filter(StringTag.class::isInstance)
+                .map(StringTag.class::cast)
+                .map(StringTag::value)
+                .map(status -> "minecraft:full".equals(status) || "full".equals(status))
+                .orElse(false);
+    }
+}

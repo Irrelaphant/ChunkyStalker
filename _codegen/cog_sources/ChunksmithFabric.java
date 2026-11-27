@@ -1,0 +1,353 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith;
+
+import com.kishku7.chunksmith.platform.ServerEnvironment;
+import com.mojang.brigadier.Command;
+import com.mojang.brigadier.builder.ArgumentBuilder;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.commands.CommandSourceStack;
+//[[[cog
+// import cog, compat
+// cog.outl(compat.identifier_import(mcver))
+//]]]
+//[[[end]]]
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerBossEvent;
+import net.minecraft.server.level.ServerPlayer;
+import com.kishku7.chunksmith.command.ChunksmithCommand;
+import com.kishku7.chunksmith.command.CommandArguments;
+import com.kishku7.chunksmith.command.CommandLiteral;
+import com.kishku7.chunksmith.command.suggestion.SuggestionProviders;
+import com.kishku7.chunksmith.event.task.GenerationTaskFinishEvent;
+import com.kishku7.chunksmith.event.task.GenerationTaskUpdateEvent;
+import com.kishku7.chunksmith.listeners.bossbar.BossBarTaskFinishListener;
+import com.kishku7.chunksmith.listeners.bossbar.BossBarTaskUpdateListener;
+import com.kishku7.chunksmith.platform.FabricPlayer;
+import com.kishku7.chunksmith.platform.FabricSender;
+import com.kishku7.chunksmith.platform.FabricServer;
+import com.kishku7.chunksmith.platform.Sender;
+import com.kishku7.chunksmith.platform.impl.GsonConfig;
+import com.kishku7.chunksmith.util.ServerSideRendererError;
+import com.kishku7.chunksmith.util.StructureFaultReporter;
+import com.kishku7.chunksmith.util.TranslationKey;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+//[[[cog
+// import cog, compat
+// pkg = compat.command_argument_package(mcver)
+// cog.outl("import static %s.IntegerArgument%s.integer;" % (pkg, compat.command_argument_suffix(mcver)))
+// cog.outl("import static %s.StringArgument%s.string;" % (pkg, compat.command_argument_suffix(mcver)))
+// cog.outl("import static %s.StringArgument%s.word;" % (pkg, compat.command_argument_suffix(mcver)))
+//]]]
+import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
+import static com.mojang.brigadier.arguments.StringArgumentType.string;
+import static com.mojang.brigadier.arguments.StringArgumentType.word;
+//[[[end]]]
+import static net.minecraft.commands.Commands.argument;
+import static net.minecraft.commands.Commands.literal;
+import static net.minecraft.commands.arguments.DimensionArgument.dimension;
+import static net.minecraft.commands.arguments.EntityArgument.player;
+import org.slf4j.LoggerFactory;
+
+public class ChunksmithFabric implements ModInitializer {
+    static {
+        PlatformCompat.ENABLE_MOONRISE_WORKAROUNDS = FabricLoader.getInstance().isModLoaded("moonrise");
+        // C2ME rewrites the chunk ticket/distance manager onto its own concurrent scheduler;
+        // see PlatformCompat.ENABLE_C2ME_TICKET_COMPAT javadoc for why this changes how we
+        // drive the distance manager after adding a ticket.
+        PlatformCompat.ENABLE_C2ME_TICKET_COMPAT = FabricLoader.getInstance().isModLoaded("c2me");
+    }
+    private Chunksmith chunky;
+    //[[[cog
+    // import cog, compat
+    // cog.outl("private final Map<%s, ServerBossEvent> bossBars = new ConcurrentHashMap<>();" % compat.identifier_type(mcver))
+    //]]]
+    //[[[end]]]
+
+    @Override
+    public void onInitialize() {
+        if (FabricLoader.getInstance().isModLoaded("chunky")) {
+            LoggerFactory.getLogger("Chunksmith").error("The original Chunky mod is installed alongside Chunksmith. They share internal classes and will conflict - remove the Chunky jar and keep only Chunksmith.");
+        }
+        ServerLifecycleEvents.SERVER_STARTED.register(minecraftServer -> {
+            // An LOD renderer on a DEDICATED server is duplicated work Chunksmith does not need; it
+            // builds its own LOD data and serves it to each player's client. Logged at ERROR (red, once,
+            // at startup) because a WARN was missed by the operator it was written for -- but we still do
+            // not act on it: it is the operator's machine. See ServerSideRendererError.
+            // Publish what this JVM is before anything reads the config: the dispatch-width
+            // default is resolved off this, and a client sharing its cores with the renderer
+            // needs a different curve from a server that has the box to itself (mod_support #33).
+            ServerEnvironment.setDedicated(minecraftServer.isDedicatedServer());
+            ServerSideRendererError.lines(minecraftServer.isDedicatedServer(), FabricLoader.getInstance()::isModLoaded)
+                    .forEach(line -> LoggerFactory.getLogger("Chunksmith").error(line));
+            Path configDir = FabricLoader.getInstance().getConfigDir();
+            Path baseDir = configDir.resolve("chunksmith");
+            Path legacyDir = configDir.resolve("chunky");
+            // Auto-migrate the legacy Chunky config on first run: if our directory does not
+            // yet exist but a chunky directory does, take it over in place. If chunksmith
+            // already exists, the legacy directory is left untouched.
+            if (!Files.exists(baseDir) && Files.exists(legacyDir)) {
+                try {
+                    Files.move(legacyDir, baseDir);
+                    LoggerFactory.getLogger("Chunksmith").info("Migrated existing config/chunky to config/chunksmith.");
+                } catch (IOException e) {
+                    LoggerFactory.getLogger("Chunksmith").warn("Could not migrate config/chunky to config/chunksmith; using the existing chunky directory.", e);
+                    baseDir = legacyDir;
+                }
+            }
+            Path configPath = baseDir.resolve("config.json");
+            StructureFaultReporter.get().setReportFile(baseDir.resolve("worldgen-faults.txt"));
+            this.chunky = new Chunksmith(new FabricServer(this, minecraftServer), new GsonConfig(configPath));
+            if (chunky.getConfig().getContinueOnRestart()) {
+                chunky.getCommands().get(CommandLiteral.CONTINUE).execute(chunky.getServer().getConsole(), CommandArguments.empty());
+            }
+            chunky.getEventBus().subscribe(GenerationTaskUpdateEvent.class, new BossBarTaskUpdateListener(bossBars));
+            chunky.getEventBus().subscribe(GenerationTaskFinishEvent.class, new BossBarTaskFinishListener(bossBars));
+            FabricLoader.getInstance().getEntrypointContainers("chunky", ModInitializer.class)
+                    .forEach(entryPoint -> entryPoint.getEntrypoint().onInitialize());
+            // WORLD-ENTER PREGEN (mod_support #20). Last inside this handler, deliberately: it calls
+            // ChunksmithProvider.get(), so it must run AFTER the Chunksmith above is constructed.
+            // Lives here rather than in LodInit because it has nothing to do with LOD -- hanging it
+            // off has_lod would silently drop the hook on any future cell that has one and not the
+            // other.
+            //[[[cog
+            // import cog, compat
+            // if compat.has_world_enter(mcver, loader):
+            //     cog.outl("com.kishku7.chunksmith.worldenter.WorldEnterPregen.onServerStarted(")
+            //     cog.outl("        minecraftServer, !minecraftServer.isDedicatedServer());")
+            //]]]
+            //[[[end]]]
+        });
+        ServerLifecycleEvents.SERVER_STOPPING.register(minecraftServer -> {
+            if (chunky != null) {
+                chunky.disable();
+            }
+        });
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            // Primary commands plus deprecated aliases (which emit a notice pointing to /cs).
+            dispatcher.register(buildCommand(CommandLiteral.CS));
+            dispatcher.register(buildCommand(CommandLiteral.CHUNKSMITH));
+            dispatcher.register(buildCommand(CommandLiteral.CHUNKY));
+            dispatcher.register(buildCommand(CommandLiteral.CY));
+            //[[[cog
+            // import cog, compat
+            // if compat.has_lod(mcver, loader) and compat.command_args_wrapped(mcver):
+            //     cog.outl('// No legacy /cslod stub on 26.4+: no 3.x client exists for these versions, and the stub')
+            //     cog.outl('// hides itself per player with a requires() predicate that 26.4 cannot serialise.')
+            // elif compat.has_lod(mcver, loader):
+            //     cog.outl('// Legacy compat: /cslod exists on a 4.x server ONLY to tell a 3.x client why its LOD')
+            //     cog.outl('// commands are gone. requires() hides it from everyone else, so on a 4.x client the')
+            //     cog.outl('// name is genuinely absent rather than present-and-scolding.')
+            //     cog.outl('dispatcher.register(com.kishku7.chunksmith.lod.legacy.CsLodLegacyCommand.build());')
+            // else:
+            //     cog.outl('// No LOD on this cell, so no legacy /cslod stub either.')
+            //]]]
+            //[[[end]]]
+        });
+    }
+
+    /** The /cs permission rule: always allowed on a singleplayer world, otherwise chunksmith.command (op by default). */
+    private static boolean canUseRoot(CommandSourceStack source) {
+        MinecraftServer minecraftServer = source.getServer();
+        if (minecraftServer != null && minecraftServer.isSingleplayer()) {
+            return true;
+        }
+        return new FabricSender(source).hasPermission("chunksmith.command", true);
+    }
+
+    // 26.4 only accepts a PermissionProviderCheck in requires(): the tree is sent to the client, so an
+    // arbitrary predicate cannot be serialised and Commands.<init> throws. On those versions requires() is
+    // pass-through, the singleplayer-or-permission rule moves into the executor (rootDenied), and the
+    // /cs border node is shown even when the border integration is absent (its executor already says so).
+    //[[[cog
+    // import cog, compat
+    // if compat.command_args_wrapped(mcver):
+    //     cog.outl("    private static java.util.function.Predicate<CommandSourceStack> rootGate() {")
+    //     cog.outl("        return net.minecraft.server.permissions.PermissionProviderCheck.ALWAYS_PASS.<CommandSourceStack>cast();")
+    //     cog.outl("    }")
+    //     cog.outl("")
+    //     cog.outl("    private java.util.function.Predicate<CommandSourceStack> borderGate() {")
+    //     cog.outl("        return net.minecraft.server.permissions.PermissionProviderCheck.ALWAYS_PASS.<CommandSourceStack>cast();")
+    //     cog.outl("    }")
+    //     cog.outl("")
+    //     cog.outl("    private static boolean rootDenied(CommandSourceStack source) {")
+    //     cog.outl("        return !canUseRoot(source);")
+    //     cog.outl("    }")
+    // else:
+    //     cog.outl("    private static java.util.function.Predicate<CommandSourceStack> rootGate() {")
+    //     cog.outl("        return ChunksmithFabric::canUseRoot;")
+    //     cog.outl("    }")
+    //     cog.outl("")
+    //     cog.outl("    private java.util.function.Predicate<CommandSourceStack> borderGate() {")
+    //     cog.outl("        return serverCommandSource -> chunky != null && chunky.getCommands().containsKey(CommandLiteral.BORDER);")
+    //     cog.outl("    }")
+    //     cog.outl("")
+    //     cog.outl("    private static boolean rootDenied(CommandSourceStack source) {")
+    //     cog.outl("        return false;")
+    //     cog.outl("    }")
+    //]]]
+    //[[[end]]]
+
+    private LiteralArgumentBuilder<CommandSourceStack> buildCommand(String root) {
+        LiteralArgumentBuilder<CommandSourceStack> command = literal(root)
+                .requires(rootGate())
+                .executes(context -> {
+                    if (rootDenied(context.getSource())) {
+                        context.getSource().sendFailure(net.minecraft.network.chat.Component.literal("You do not have permission to use this command."));
+                        return 0;
+                    }
+                    Sender sender;
+                    if (context.getSource().getEntity() instanceof final ServerPlayer player) {
+                        sender = new FabricPlayer(player);
+                    } else {
+                        sender = new FabricSender(context.getSource());
+                    }
+                    Map<String, ChunksmithCommand> commands = chunky.getCommands();
+                    String input = context.getInput().substring(context.getLastChild().getNodes().get(0).getRange().getStart());
+                    String[] tokens = input.split(" ");
+                    if (CommandLiteral.CHUNKY.equals(tokens[0]) || CommandLiteral.CY.equals(tokens[0])) {
+                        sender.sendMessagePrefixed(TranslationKey.COMMAND_DEPRECATED_ALIAS);
+                    }
+                    String subCommand = tokens.length > 1 && commands.containsKey(tokens[1]) ? tokens[1] : CommandLiteral.HELP;
+                    CommandArguments arguments = tokens.length > 2 ? CommandArguments.of(Arrays.copyOfRange(tokens, 2, tokens.length)) : CommandArguments.empty();
+                    commands.get(subCommand).execute(sender, arguments);
+                    return Command.SINGLE_SUCCESS;
+                });
+        registerArguments(command, literal(CommandLiteral.CANCEL),
+                argument(CommandLiteral.WORLD, dimension()));
+        registerArguments(command, literal(CommandLiteral.CENTER),
+                argument(CommandLiteral.X, word()),
+                argument(CommandLiteral.Z, word()));
+        registerArguments(command, literal(CommandLiteral.DEBUG),
+                argument(CommandLiteral.VALUE, word()));
+        registerArguments(command, literal(CommandLiteral.CONFIRM));
+        registerArguments(command, literal(CommandLiteral.CONTINUE),
+                argument(CommandLiteral.WORLD, dimension()));
+        registerArguments(command, literal(CommandLiteral.CORNERS),
+                argument(CommandLiteral.X1, word()),
+                argument(CommandLiteral.Z1, word()),
+                argument(CommandLiteral.X2, word()),
+                argument(CommandLiteral.Z2, word()));
+        registerArguments(command, literal(CommandLiteral.HELP),
+                argument(CommandLiteral.PAGE, integer()));
+        registerArguments(command, literal(CommandLiteral.PATTERN),
+                argument(CommandLiteral.PATTERN, string()).suggests(SuggestionProviders.PATTERNS),
+                argument(CommandLiteral.VALUE, string()));
+        registerArguments(command, literal(CommandLiteral.PAUSE),
+                argument(CommandLiteral.WORLD, dimension()));
+        registerArguments(command, literal(CommandLiteral.PROGRESS));
+        registerArguments(command, literal(CommandLiteral.QUIET),
+                argument(CommandLiteral.INTERVAL, integer()));
+        registerArguments(command, literal(CommandLiteral.RADIUS),
+                argument(CommandLiteral.RADIUS, word()),
+                argument(CommandLiteral.RADIUS, word()));
+        registerArguments(command, literal(CommandLiteral.HORIZON),
+                argument(CommandLiteral.HORIZON, word()));
+        registerArguments(command, literal(CommandLiteral.RELOAD),
+                argument(CommandLiteral.TYPE, word()));
+        registerArguments(command, literal(CommandLiteral.SET),
+                argument(CommandLiteral.TYPE, string()).suggests(SuggestionProviders.SETTINGS),
+                argument(CommandLiteral.VALUE, string()));
+        registerArguments(command, literal(CommandLiteral.SELECTION));
+        registerArguments(command, literal(CommandLiteral.SHAPE),
+                argument(CommandLiteral.SHAPE, string()).suggests(SuggestionProviders.SHAPES));
+        registerArguments(command, literal(CommandLiteral.SILENT));
+        registerArguments(command, literal(CommandLiteral.SPAWN));
+        registerArguments(command, literal(CommandLiteral.STATUS));
+        registerArguments(command, literal(CommandLiteral.START),
+                argument(CommandLiteral.WORLD, dimension()),
+                argument(CommandLiteral.SHAPE, string()).suggests(SuggestionProviders.SHAPES),
+                argument(CommandLiteral.CENTER_X, word()),
+                argument(CommandLiteral.CENTER_Z, word()),
+                argument(CommandLiteral.RADIUS_X, word()),
+                argument(CommandLiteral.RADIUS_Z, word()));
+        registerArguments(command, literal(CommandLiteral.TRIM),
+                argument(CommandLiteral.WORLD, dimension()),
+                argument(CommandLiteral.SHAPE, string()).suggests(SuggestionProviders.SHAPES),
+                argument(CommandLiteral.CENTER_X, word()),
+                argument(CommandLiteral.CENTER_Z, word()),
+                argument(CommandLiteral.RADIUS_X, word()),
+                argument(CommandLiteral.RADIUS_Z, word()),
+                argument(CommandLiteral.TRIM_MODE, string()).suggests(SuggestionProviders.TRIM_MODES),
+                argument(CommandLiteral.INHABITED, word()));
+        registerArguments(command, literal(CommandLiteral.WORLDBORDER));
+        registerArguments(command, literal(CommandLiteral.WORLD),
+                argument(CommandLiteral.WORLD, dimension()));
+        LiteralArgumentBuilder<CommandSourceStack> borderCommand = literal(CommandLiteral.BORDER)
+                .requires(borderGate())
+                .executes(command.getCommand());
+        registerArguments(borderCommand, literal(CommandLiteral.ADD),
+                argument(CommandLiteral.WORLD, dimension()),
+                argument(CommandLiteral.SHAPE, string()).suggests(SuggestionProviders.SHAPES),
+                argument(CommandLiteral.CENTER_X, word()),
+                argument(CommandLiteral.CENTER_Z, word()),
+                argument(CommandLiteral.RADIUS_X, word()),
+                argument(CommandLiteral.RADIUS_Z, word()));
+        registerArguments(borderCommand, literal(CommandLiteral.BYPASS),
+                argument(CommandLiteral.PLAYER, player()));
+        registerArguments(borderCommand, literal(CommandLiteral.HELP));
+        registerArguments(borderCommand, literal(CommandLiteral.LIST));
+        registerArguments(borderCommand, literal(CommandLiteral.LOAD),
+                argument(CommandLiteral.WORLD, dimension()));
+        registerArguments(borderCommand, literal(CommandLiteral.REMOVE),
+                argument(CommandLiteral.WORLD, dimension()));
+        registerArguments(borderCommand, literal(CommandLiteral.WRAP),
+                argument(CommandLiteral.WRAP, word()));
+        registerArguments(command, borderCommand);
+        //[[[cog
+        // import cog, compat
+        // if compat.has_lod(mcver, loader):
+        //     cog.outl('// The LOD operator node. Grafted HERE rather than routed through the shared')
+        //     cog.outl('// commandMap: that map is wired to TranslationKey and the lang files, and the LOD')
+        //     cog.outl('// feature stays out of them. Brigadier prefers this literal child over the root\'s')
+        //     cog.outl('// string-dispatching executes(), so /cs lod status reaches it and /cs status does not.')
+        //     cog.outl('command.then(com.kishku7.chunksmith.lod.CsLodCommand.buildServerNode());')
+        // else:
+        //     cog.outl('// No LOD on this cell, so no lod node. compat.has_lod says which cells have it.')
+        //]]]
+        //[[[end]]]
+        return command;
+    }
+
+    @SafeVarargs
+    private <S> void registerArguments(LiteralArgumentBuilder<S> command, ArgumentBuilder<S, ?>... arguments) {
+        for (int i = arguments.length - 1; i > 0; --i) {
+            arguments[i - 1].then(arguments[i].executes(command.getCommand()));
+        }
+        command.then(arguments[0].executes(command.getCommand()));
+    }
+
+    public Chunksmith getChunky() {
+        return chunky;
+    }
+}

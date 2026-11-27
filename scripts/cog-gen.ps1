@@ -1,0 +1,760 @@
+<#
+.SYNOPSIS
+  ChunkSmith Cog code-generation driver for one cell.
+
+.DESCRIPTION
+  Materialises a per-cell, per-MC-version copy of the shared mixin/accessor
+  source under <Cell>/gen/, with all version drift resolved by Cog (direct-compile,
+  driven by _codegen/compat.py). Steps:
+
+    1. Wipe + recreate <Cell>/gen/ (it is a build artifact, never committed).
+    2. Copy _codegen/cog_sources/shared -> <Cell>/gen/ verbatim (D16: one source of truth).
+    3. Overwrite the drifting files with the Cog-instrumented copies from _codegen/cog_sources/.
+    4. Add/remove the presence-gated files for this MC version:
+         - ChunkStorageAccessor  : present <=1.21.10, absent 1.21.11/26
+         - MinecraftServerAccess : present 26 only
+    5. Run `cog -r -D mcver=<v>` over the Cog files (compat.py on sys.path).
+    6. Regenerate <Cell>/src/main/resources/chunksmith.mixins.json's mixins[] + compatibilityLevel
+       to match the files actually present for this version.
+
+  The cell's build.gradle.kts srcDirs <Cell>/gen/ (NOT cog_sources directly), so it
+  compiles the post-Cog output.
+
+.PARAMETER Cell
+  Path to the cell dir (e.g. Fabric/1.21.8), relative to the repo root or absolute.
+
+.PARAMETER McVer
+  The MC version key (e.g. 1.21.8, 26, 26.3-snapshot-2). Drives compat.py era selection.
+
+.EXAMPLE
+  ./cog-gen.ps1 -Cell Fabric/1.21.8 -McVer 1.21.8
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$Cell,
+    [Parameter(Mandatory = $true)][string]$McVer,
+    # Loader for this cell. Only Forge changes behaviour: classic-SRG Forge (the ancient 1.20.1/
+    # 1.20.4 line) needs a "refmap" key in chunksmith.mixins.json; every other loader/version omits
+    # it (mojmap-native or loom-managed). Auto-detected from the cell path when not given.
+    [Parameter(Mandatory = $false)][ValidateSet('Fabric','NeoForge','Forge')][string]$Loader
+)
+
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path $PSScriptRoot -Parent   # cog-gen.ps1 lives in scripts/; repo root is one up
+$codegen  = Join-Path $repoRoot '_codegen'
+$cogSrc   = Join-Path $codegen 'cog_sources'
+
+# Resolve the cell path (allow relative-to-repo).
+if ([System.IO.Path]::IsPathRooted($Cell)) {
+    $cellPath = $Cell
+} else {
+    $cellPath = Join-Path $repoRoot $Cell
+}
+if (-not (Test-Path $cellPath)) { throw "Cell not found: $cellPath" }
+
+# Resolve the loader (default: infer from the cell path, e.g. "Forge/1.21.4" -> Forge).
+if (-not $Loader) {
+    $leadSeg = ($Cell -replace '\\', '/').TrimStart('/').Split('/')[0]
+    if ($leadSeg -in @('Fabric','NeoForge','Forge')) { $Loader = $leadSeg } else { $Loader = 'Fabric' }
+}
+
+# D16 (2026-07-10): shared_minecraft is GONE -- cog_sources is the ONE source of truth.
+# The invariant (non-drifting) shared classes now live in _codegen/cog_sources/shared.
+$sharedJava = Join-Path $cogSrc 'shared'
+if (-not (Test-Path $sharedJava)) { throw "cog_sources/shared not found: $sharedJava" }
+
+$genDir     = Join-Path $cellPath 'gen'
+$genJava    = Join-Path $genDir 'src/main/java'
+$mixinPkg   = 'com/kishku7/chunksmith/mixin'
+
+Write-Host "[cog-gen] cell=$Cell mcver=$McVer"
+
+# --- Step 1: clean gen/ ---
+if (Test-Path $genDir) { Remove-Item -Recurse -Force $genDir }
+New-Item -ItemType Directory -Force -Path $genJava | Out-Null
+
+# --- Step 2: copy the invariant shared java (cog_sources/shared) verbatim ---
+Copy-Item -Recurse -Force (Join-Path $sharedJava '*') $genJava
+
+# --- Step 3: overwrite drifting files with the Cog-instrumented copies ---
+# Each entry is: cog_source basename => destination path RELATIVE to gen java root.
+# These files carry Cog markers; the plain shared copies are replaced so cog can process them.
+$driftMap = [ordered]@{
+    'ServerChunkCacheMixin.java'                = 'com/kishku7/chunksmith/mixin/ServerChunkCacheMixin.java'
+    'WorldGenRegionMixin.java'                  = 'com/kishku7/chunksmith/mixin/WorldGenRegionMixin.java'
+    'StructureStartMixin.java'                  = 'com/kishku7/chunksmith/mixin/StructureStartMixin.java'
+    'MinecraftServerMixin.java'                 = 'com/kishku7/chunksmith/mixin/MinecraftServerMixin.java'
+    'IOWorkerAccessor.java'                     = 'com/kishku7/chunksmith/mixin/IOWorkerAccessor.java'
+    'EntityStorageAccessor.java'                = 'com/kishku7/chunksmith/mixin/EntityStorageAccessor.java'
+    'PersistentEntitySectionManagerMixin.java'  = 'com/kishku7/chunksmith/mixin/PersistentEntitySectionManagerMixin.java'
+    'BossBarTaskFinishListener.java'            = 'com/kishku7/chunksmith/listeners/bossbar/BossBarTaskFinishListener.java'
+    'BossBarTaskUpdateListener.java'            = 'com/kishku7/chunksmith/listeners/bossbar/BossBarTaskUpdateListener.java'
+}
+foreach ($name in $driftMap.Keys) {
+    $src = Join-Path $cogSrc $name
+    $dst = Join-Path $genJava $driftMap[$name]
+    if (-not (Test-Path $src)) { throw "cog_source missing: $src" }
+    # D16: the drift files are no longer duplicated in the shared tree, so their package dir may not
+    # exist yet in gen/ (e.g. listeners/bossbar, whose only members are drift files). Create it.
+    New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+    Copy-Item -Force $src $dst
+}
+
+# --- Step 3b: loader entrypoint, single-sourced via cog (D15). Chunksmith<Loader>.java is emitted
+# from ONE cog_source per loader (drift resolved by compat.py) into gen/, replacing the hand-copied
+# per-cell src/main/java entrypoint (deleted 2026-07-10). ---
+$entrypointName = "Chunksmith$Loader.java"
+$entrypointSrc  = Join-Path $cogSrc $entrypointName
+$entrypointDst  = Join-Path $genJava "com/kishku7/chunksmith/$entrypointName"
+if (-not (Test-Path $entrypointSrc)) { throw "cog_source entrypoint missing: $entrypointSrc" }
+Copy-Item -Force $entrypointSrc $entrypointDst
+
+# --- Step 3c: platform Border, single-sourced via cog (D14, 2026-07-10). FabricBorder was
+# byte-identical across all 10 Fabric cells and NeoForgeBorder across all 16 Forge/NeoForge cells
+# (26 hand-copies, zero drift) -- now emitted from ONE cog_source per loader; the per-cell copies
+# were deleted. Border carries no version drift, so it is copied plain (no cog markers). ---
+$borderName = if ($Loader -eq 'Fabric') { 'FabricBorder.java' } else { 'NeoForgeBorder.java' }
+$borderSrc  = Join-Path $cogSrc $borderName
+$borderDst  = Join-Path $genJava "com/kishku7/chunksmith/platform/$borderName"
+if (-not (Test-Path $borderSrc)) { throw "cog_source border missing: $borderSrc" }
+New-Item -ItemType Directory -Force -Path (Split-Path $borderDst) | Out-Null
+Copy-Item -Force $borderSrc $borderDst
+Write-Host "[cog-gen] + $borderName (single-sourced platform border)"
+
+# --- Step 3d: platform ADAPTERS, single-sourced (D16, 2026-07-28). The 8 per-cell adapter
+# classes (Fabric/NeoForge x Player/Sender/Server/World) were the LAST hand-copied master in the
+# mod -- 104 files across the 26 cells, carrying real MC-era drift (FabricWorld had 9 distinct
+# bodies across 10 cells, NeoForgeWorld 11 across 16, and on 26 the *World classes are a
+# structural fork, not a rename set). They now live in _codegen/compat_platform.py as whole-file
+# era variants plus a measured cell->variant map, and are materialised here -- same treatment
+# Border got in Step 3c. Verify with scripts/verify-platform.py (hash oracle). ---
+$platformDir = Join-Path $genJava 'com/kishku7/chunksmith/platform'
+New-Item -ItemType Directory -Force -Path $platformDir | Out-Null
+$cellName = ($Cell -replace '\\', '/').TrimStart('/').Split('/')[-1]
+Push-Location $codegen
+try {
+    $platformList = (& python -c "import compat_platform,sys; sys.stdout.write(','.join(sorted(compat_platform.platform_classes('$Loader','$cellName'))))")
+    if ($LASTEXITCODE -ne 0) { throw 'compat_platform query failed' }
+    if ($platformList) {
+        foreach ($cls in $platformList.Split(',')) {
+            $dst = Join-Path $platformDir "$cls.java"
+            & python -c "import compat_platform,io,sys; io.open(sys.argv[1],'w',encoding='utf-8',newline='\n').write(compat_platform.platform_source(sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5]))" $dst $cls $Loader $cellName $McVer
+            if ($LASTEXITCODE -ne 0) { throw "platform emit failed: $cls" }
+        }
+        Write-Host "[cog-gen] + platform adapters: $platformList"
+    } else {
+        throw "no platform adapters mapped for $Loader/$cellName -- add it to compat_platform.CELL_MAP"
+    }
+} finally { Pop-Location }
+
+# --- Step 4: presence-gated files (query compat.py so the rule lives in ONE place) ---
+Push-Location $codegen
+try {
+    $hasChunkStorage = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_chunk_storage_accessor('$McVer') else '0')")
+    $hasSimpleRegionStorage = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_simple_region_storage_accessor('$McVer') else '0')")
+    $hasMcServerAcc  = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_minecraft_server_access('$McVer') else '0')")
+    $hasTicketStorage = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_ticket_storage('$McVer') else '0')")
+    $hangingClass    = (& python -c "import compat,sys; sys.stdout.write(compat.hanging_entity_class('$McVer'))")
+    # JAVA_17 for 1.20.x and 26+ (as before). Also JAVA_17 for classic-Forge cells at MC 1.21/1.21.1:
+    # Forge 51.0.0 (MC 1.21) bundles Mixin 0.8.5 which does not recognise JAVA_21 and hard-crashes at
+    # launch ("compatibility level JAVA_21 which is not recognised"). Level = mixin language features,
+    # not bytecode version, so JAVA_17 is safe for our plain-code mixins there.
+    $forgeOldMixin = if ($Loader -eq 'Forge') { 'True' } else { 'False' }
+    $compatLevel     = (& python -c "import compat,sys; v=compat._parse('$McVer'); sys.stdout.write('JAVA_17' if (v[0]>=26 or v[0]==1 and v[1]<=20 or ($forgeOldMixin and v[:3]<(1,21,2))) else 'JAVA_21')")
+    $forgeNeedsRefmap = (& python -c "import compat,sys; sys.stdout.write('1' if compat.forge_needs_refmap('$McVer') else '0')")
+# WHICH freeze mechanism does this cell ship? Not "does vanilla have one" -- the pre-26 cells are
+# RANGES, and the 1.20.4 cell straddles the 1.20.3 boundary, so it ships the hand-rolled freeze on
+# both sides of it. See compat.hand_rolled_freeze.
+$handRolledFreeze = (& python -c "import compat,sys; sys.stdout.write('1' if compat.hand_rolled_freeze('$McVer') else '0')")
+# EventBus era, for the world-enter ARMING assertion after the cog run (step 5b).
+$forgeNewEventBus = (& python -c "import compat,sys; sys.stdout.write('1' if compat.forge_new_eventbus('$McVer') else '0')")
+} finally {
+    Pop-Location
+}
+
+$chunkStorageDst = Join-Path $genJava (Join-Path $mixinPkg 'ChunkStorageAccessor.java')
+if ($hasChunkStorage -eq '1') {
+    # ChunkStorageAccessor is NOT in cog_sources/shared (26-shaped); inject it for older versions.
+    Copy-Item -Force (Join-Path $cogSrc 'ChunkStorageAccessor.java') $chunkStorageDst
+    Write-Host "[cog-gen] + ChunkStorageAccessor (present on $McVer)"
+} else {
+    if (Test-Path $chunkStorageDst) { Remove-Item -Force $chunkStorageDst }
+    Write-Host "[cog-gen] - ChunkStorageAccessor (absent on $McVer)"
+}
+
+$mcServerAccDst = Join-Path $genJava (Join-Path $mixinPkg 'MinecraftServerAccess.java')
+if ($hasMcServerAcc -eq '1') {
+    Write-Host "[cog-gen] + MinecraftServerAccess (present on $McVer)"
+    # already copied from cog_sources/shared; leave it.
+} else {
+    if (Test-Path $mcServerAccDst) { Remove-Item -Force $mcServerAccDst }
+    Write-Host "[cog-gen] - MinecraftServerAccess (absent on $McVer)"
+}
+
+# TICKET DIAGNOSTICS (2026-08-20). TicketStorage + the chunk.status ChunkStatus package are
+# 1.21.11-and-newer shapes. These three files were written against the live server that had the
+# residency bug and compiled NOWHERE else -- which is how the entire 3.5-3.13 line ended up with jars
+# for 1.21.11 only, and therefore no CRITICAL smoketest coverage at all. Gate them like any other
+# presence-drift file: where the gate is false the class is NOT GENERATED, so there is no stub to
+# maintain and chunksmith.mixins.json (regenerated from the files present) drops them automatically.
+$ticketDiagFiles = @(
+    (Join-Path $genJava (Join-Path $mixinPkg 'MinecraftServerTicketsMixin.java')),
+    (Join-Path $genJava (Join-Path $mixinPkg 'DistanceManagerMixin.java')),
+    (Join-Path $genJava (Join-Path $mixinPkg 'TicketMixin.java'))
+)
+if ($hasTicketStorage -eq '1') {
+    Write-Host "[cog-gen] + ticket diagnostics (TicketStorage present on $McVer)"
+    # already copied from cog_sources/shared; leave them.
+} else {
+    foreach ($f in $ticketDiagFiles) { if (Test-Path $f) { Remove-Item -Force $f } }
+    Write-Host "[cog-gen] - ticket diagnostics (no TicketStorage on $McVer)"
+}
+
+# SimpleRegionStorage landed at 1.20.5; on ancient (1.20.1/1.20.4) the class does not exist, so
+# SimpleRegionStorageAccessor cannot compile -> drop it there. Present transitional and newer.
+$simpleRegionStorageDst = Join-Path $genJava (Join-Path $mixinPkg 'SimpleRegionStorageAccessor.java')
+if ($hasSimpleRegionStorage -eq '1') {
+    Write-Host "[cog-gen] + SimpleRegionStorageAccessor (present on $McVer)"
+    # already copied from cog_sources/shared; leave it.
+} else {
+    if (Test-Path $simpleRegionStorageDst) { Remove-Item -Force $simpleRegionStorageDst }
+    Write-Host "[cog-gen] - SimpleRegionStorageAccessor (absent on $McVer)"
+}
+
+# --- Hanging / BlockAttached presence swap (invalid-position log suppressor). ---
+# cog_sources/shared carries the 1.21.*+ shape (BlockAttachedEntityMixin, @Mixin BlockAttachedEntity).
+# On the 1.20.* line the target class is HangingEntity, so swap in the HangingEntityMixin cog_source
+# (same @Redirect body) and drop BlockAttachedEntityMixin. Both are Cog-processed (no markers today,
+# but running cog is harmless and keeps them uniform if markers are added later).
+$blockAttachedDst = Join-Path $genJava (Join-Path $mixinPkg 'BlockAttachedEntityMixin.java')
+$hangingDst       = Join-Path $genJava (Join-Path $mixinPkg 'HangingEntityMixin.java')
+if ($hangingClass -eq 'HangingEntity') {
+    if (Test-Path $blockAttachedDst) { Remove-Item -Force $blockAttachedDst }
+    Copy-Item -Force (Join-Path $cogSrc 'HangingEntityMixin.java') $hangingDst
+    Write-Host "[cog-gen] + HangingEntityMixin / - BlockAttachedEntityMixin (1.20.* target on $McVer)"
+} else {
+    if (Test-Path $hangingDst) { Remove-Item -Force $hangingDst }
+    # BlockAttachedEntityMixin already present from cog_sources/shared; leave it.
+    Write-Host "[cog-gen] + BlockAttachedEntityMixin (1.21.*+ target on $McVer)"
+}
+
+# --- Step 5: run Cog over the drift files (compat.py on PYTHONPATH via the -D define) ---
+# Cog is invoked from _codegen so `import compat` resolves. -r rewrites in place.
+$cogTargets = @()
+foreach ($name in $driftMap.Keys) {
+    $cogTargets += (Join-Path $genJava $driftMap[$name])
+}
+$cogTargets += $entrypointDst
+# SuggestionProviders is copied verbatim from cog_sources/shared like every other invariant class, but
+# carries one version gate (26.4 only accepts serialisable suggestion providers), so it must be cogged.
+# Without this line the gate sat in the source as a comment and every cell kept the pass-through.
+$spDst = Join-Path $genJava 'com/kishku7/chunksmith/command/suggestion/SuggestionProviders.java'
+if (Test-Path $spDst) { $cogTargets += $spDst }
+
+# --- Step 4b: the LOD feature (3.0.0-beta-1). Server-side LOD is carried ONLY by the cells that have a
+# real client-side renderer to serve (compat.has_lod). The whole cell-side surface -- LodSupport,
+# CsLodExtractor, CsLodCommand, LodInit, CsLodServerNet, CsLodInBandSender, CsLodChannel -- is
+# single-sourced in _codegen/cog_sources/lod and materialised here; the MC-agnostic protocol/store
+# (CsLodProtocol/CsLodMessages/CsLodTokens/CsLodHttpServer/CsLodChunk/CsLodCodec/CsLodRegionStore) lives
+# in shared_common and is already on every cell's classpath.
+#
+# Three per-loader FILE choices (conditional presence, not markers -- the shapes are too different):
+#   LodInit_<loader>.java              -> lod/LodInit.java
+#   LodPlatform_<loader>.java          -> lod/LodPlatform.java
+#   CsLodChannel_<net era>.java        -> lod/net/CsLodChannel.java
+#
+# The RENDERER ADAPTERS -- the SINGLEPLAYER injection path -- are materialised here too, each behind its
+# own gate, because each compiles directly against a third-party jar that only exists on some cells:
+#   compat.has_dh    (EVERY LOD cell -- DH ships one)  -> CsLodDhSupport + CsLodDhGenerator + CsLodDhPusher
+#   compat.has_voxy  (Fabric 1.21.11 + Fabric 26 only) -> VoxyLodSink + CsLodVoxyInjector
+#   either of those                                     -> CsLodSectionBuilder (the shared inverse of the
+#                                                          extractor; this is where the 1.21.11 palette /
+#                                                          registry drift is resolved)
+# Where a gate is false the class is NOT GENERATED AT ALL -- a compile-time-absent seam, not a stub. That
+# is what keeps the mod from ever claiming a renderer it cannot feed.
+Push-Location $codegen
+try {
+    $hasLod = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_lod('$McVer','$Loader') else '0')")
+    $lodNetEra = if ($hasLod -eq '1') { (& python -c "import compat,sys; sys.stdout.write(compat.lod_net_era('$McVer','$Loader'))") } else { '' }
+    $hasDh = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_dh('$McVer','$Loader') else '0')")
+    $hasVoxy = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_voxy('$McVer','$Loader') else '0')")
+    $hasSectionBuilder = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_section_builder('$McVer','$Loader') else '0')")
+    $hasLodClient = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_lod_client('$McVer','$Loader') else '0')")
+    $hasWorldEnter = (& python -c "import compat,sys; sys.stdout.write('1' if compat.has_world_enter('$McVer','$Loader') else '0')")
+} finally {
+    Pop-Location
+}
+
+# --- Step 4d: the WORLD-ENTER PREGEN (compat.has_world_enter) -- mod_support #20.
+#
+# Pre-generates a single-player world on entry, behind a progress screen, before handing the player
+# control. 26.x on Fabric and NeoForge only for now: 1.20.1 has no ServerTickRateManager to freeze
+# with, and a dedicated server has no world-entry moment at all.
+#
+# SIDE GUARDING -- the screen is CLIENT-ONLY and must never load on a dedicated server. Same rule and
+# same mechanism as step 4c: the guard is the LOADER's, not a runtime if. WorldEnterPregen itself is
+# server-side (it drives the integrated server) and is safe on both sides; only the screen is gated.
+$worldEnterDir = Join-Path $genJava 'com/kishku7/chunksmith/worldenter'
+if ($hasWorldEnter -eq '1') {
+    $weSrc = Join-Path $cogSrc 'worldenter'
+    New-Item -ItemType Directory -Force -Path $worldEnterDir | Out-Null
+    $weMap = [ordered]@{
+        'WorldEnterPregen.java' = 'WorldEnterPregen.java'
+    }
+    foreach ($name in $weMap.Keys) {
+        $src = Join-Path $weSrc $name
+        if (-not (Test-Path $src)) { throw "worldenter cog_source missing: $src" }
+        $dst = Join-Path $worldEnterDir $weMap[$name]
+        Copy-Item -Force $src $dst
+        # MUST be appended to $cogTargets. A copied-but-not-cogged file keeps its //[[[cog]]] block
+        # empty, and the compiler reports it as a missing return where the generated line should be.
+        $cogTargets += $dst
+    }
+    # The CLIENT half: the progress screen, the tick hook that shows it, and the per-loader
+    # entrypoint. Same gate as the orchestrator -- the screen IS the reason this feature is
+    # single-player-only, so there is no cell that wants one without the other.
+    #
+    # SIDE GUARD, per loader (the guard is the LOADER's, never a runtime if -- a runtime check still
+    # CLASS-LOADS the Screen, which is the crash being avoided):
+    #   Fabric   -- WorldEnterClientInit is a "client" entrypoint in fabric.mod.json.
+    #   NeoForge -- WorldEnterClientInit is @EventBusSubscriber(value = Dist.CLIENT); FML filters on
+    #               the annotation scan, before class-loading. Note FML 10 has no `bus` element at
+    #               all, so game-bus is the only bus the annotation addresses.
+    $weCliSrc = Join-Path $weSrc 'client'
+    $weCliDir = Join-Path $worldEnterDir 'client'
+    New-Item -ItemType Directory -Force -Path $weCliDir | Out-Null
+    foreach ($name in @('WorldEnterScreen.java', 'WorldEnterClientHook.java')) {
+        $src = Join-Path $weCliSrc $name
+        if (-not (Test-Path $src)) { throw "worldenter client cog_source missing: $src" }
+        $dst = Join-Path $weCliDir $name
+        Copy-Item -Force $src $dst
+        $cogTargets += $dst
+    }
+    $weInitSrc = Join-Path $weCliSrc ("WorldEnterClientInit_{0}.java" -f $Loader.ToLower())
+    if (-not (Test-Path $weInitSrc)) { throw "worldenter client entrypoint cog_source missing: $weInitSrc" }
+    $weInitDst = Join-Path $weCliDir 'WorldEnterClientInit.java'
+    Copy-Item -Force $weInitSrc $weInitDst
+    $cogTargets += $weInitDst
+    # TickRateManagerMixin freezes the PLAYER for the duration of a world-enter run (3.17.1). It
+    # came in with the shared copy in Step 2 and stays here; it is listed in chunksmith.mixins.json
+    # automatically, because Step 6 enumerates the files actually present rather than a hand list.
+    # --- FREEZE MECHANISM SWAP, by whether vanilla has one (compat.has_tick_rate_manager). ---
+    # 1.20.3+ : borrow vanilla's freeze (setFrozen) and override only its PLAYER exemption, which is
+    #           what TickRateManagerMixin does. The freeze mixins must NOT be present -- their
+    #           redirects target calls that vanilla already guards, so they would double up.
+    # <1.20.3 : TickRateManager does not exist, so TickRateManagerMixin cannot even be generated (its
+    #           @Mixin target class is absent). ServerLevelFreezeMixin + LevelEntityFreezeMixin
+    #           re-add vanilla's own guards from outside. Freezing the entity funnel freezes players
+    #           too, so no exemption override is needed there.
+    $tickRateMixinDst   = Join-Path $genJava (Join-Path $mixinPkg 'TickRateManagerMixin.java')
+    $serverFreezeDst    = Join-Path $genJava (Join-Path $mixinPkg 'ServerLevelFreezeMixin.java')
+    $entityFreezeDst    = Join-Path $genJava (Join-Path $mixinPkg 'LevelEntityFreezeMixin.java')
+    if ($handRolledFreeze -ne '1') {
+        foreach ($stale in @($serverFreezeDst, $entityFreezeDst)) {
+            if (Test-Path $stale) { Remove-Item -Force $stale }
+        }
+        Write-Host "[cog-gen] + TickRateManagerMixin (player freeze; vanilla tick freeze borrowed)"
+        # Vanilla skips the ticket purge while frozen, so the borrowed freeze would keep every chunk
+        # the run touched loaded (issue #37). ServerChunkCacheFreezeMixin re-runs it under our freeze.
+        $purgeShape = (& python -c "import sys; sys.path.insert(0, sys.argv[1]); import compat; sys.stdout.write(compat.ticket_purge_shape(sys.argv[2]))" $codegen $McVer)
+        if ($LASTEXITCODE -ne 0 -or -not $purgeShape) { throw "compat.ticket_purge_shape failed for $McVer" }
+        $scfDst = Join-Path $genJava (Join-Path $mixinPkg 'ServerChunkCacheFreezeMixin.java')
+        Copy-Item -Force (Join-Path $cogSrc 'ServerChunkCacheFreezeMixin.java') $scfDst
+        $cogTargets += $scfDst
+        Copy-Item -Force (Join-Path $cogSrc 'ChunkMapFreezeUnloadMixin.java') (Join-Path $genJava (Join-Path $mixinPkg 'ChunkMapFreezeUnloadMixin.java'))
+        $dmpDst = Join-Path $genJava (Join-Path $mixinPkg 'DistanceManagerPurgeInvoker.java')
+        if ($purgeShape -eq 'dm') {
+            Copy-Item -Force (Join-Path $cogSrc 'DistanceManagerPurgeInvoker.java') $dmpDst
+        } elseif (Test-Path $dmpDst) { Remove-Item -Force $dmpDst }
+        Write-Host "[cog-gen] + ServerChunkCacheFreezeMixin (ticket purge under the freeze; shape $purgeShape)"
+    } else {
+        if (Test-Path $tickRateMixinDst) { Remove-Item -Force $tickRateMixinDst }
+        foreach ($pg in @('ServerChunkCacheFreezeMixin.java', 'DistanceManagerPurgeInvoker.java', 'ChunkMapFreezeUnloadMixin.java')) {
+            $pgDst = Join-Path $genJava (Join-Path $mixinPkg $pg)
+            if (Test-Path $pgDst) { Remove-Item -Force $pgDst }
+        }
+        foreach ($fz in @('ServerLevelFreezeMixin.java', 'LevelEntityFreezeMixin.java')) {
+            $fzSrc = Join-Path $cogSrc $fz
+            if (-not (Test-Path $fzSrc)) { throw "hand-rolled freeze cog_source missing: $fzSrc" }
+            $fzDst = Join-Path $genJava (Join-Path $mixinPkg $fz)
+            Copy-Item -Force $fzSrc $fzDst
+            $cogTargets += $fzDst
+        }
+        Write-Host "[cog-gen] + ServerLevelFreezeMixin + LevelEntityFreezeMixin (HAND-ROLLED freeze on $McVer)"
+        Write-Host "[cog-gen] - TickRateManagerMixin (cell uses the hand-rolled freeze; nothing to override)"
+    }
+    Write-Host "[cog-gen] + WORLD-ENTER pregen (mod_support #20)"
+} else {
+    if (Test-Path $worldEnterDir) { Remove-Item -Recurse -Force $worldEnterDir }
+    # TickRateManagerMixin imports WorldEnterPregen, which does not exist on a cell without the
+    # feature -- so it is not a stub to maintain, it is a file that must not be generated at all.
+    # Same treatment as the ticket diagnostics above: drop the FILE and Step 6 drops the json entry
+    # with it. Leaving it would break the build on every pre-26 cell.
+    foreach ($fzName in @('TickRateManagerMixin.java', 'ServerLevelFreezeMixin.java', 'LevelEntityFreezeMixin.java', 'ServerChunkCacheFreezeMixin.java', 'DistanceManagerPurgeInvoker.java', 'ChunkMapFreezeUnloadMixin.java')) {
+        $fzGone = Join-Path $genJava (Join-Path $mixinPkg $fzName)
+        if (Test-Path $fzGone) { Remove-Item -Force $fzGone }
+    }
+    Write-Host "[cog-gen] - freeze mixins (no world-enter on $Loader/$McVer)"
+    Write-Host "[cog-gen] - WORLD-ENTER pregen (not gated on for $Loader/$McVer)"
+}
+
+# Cross-check the gate against the Fabric manifest. fabric.mod.json is a STATIC per-cell resource --
+# cog-gen does not generate it -- so the gate and the manifest CAN drift apart. If they do, nothing
+# fails at build time: the jar builds green and the client dies at load with a missing entrypoint
+# class. Turn that into a build error, which is where it belongs.
+if ($Loader -eq 'Fabric') {
+    $fmj = Join-Path $cellPath 'src/main/resources/fabric.mod.json'
+    if (Test-Path $fmj) {
+        $declared = (Get-Content $fmj -Raw) -match 'worldenter\.client\.WorldEnterClientInit'
+        $gated = ($hasWorldEnter -eq '1')
+        if ($declared -and -not $gated) {
+            throw "fabric.mod.json declares WorldEnterClientInit but compat.has_world_enter is false for $Loader/$McVer -- the client would crash at load. Remove the entrypoint or widen the gate."
+        }
+        if ($gated -and -not $declared) {
+            throw "compat.has_world_enter is true for $Loader/$McVer but fabric.mod.json does not declare WorldEnterClientInit -- the screen would never open. Add it to the 'client' entrypoints."
+        }
+
+        # Same check for /csclient (4.0.0). Same failure mode, same reason it has to be a build error:
+        # an undeclared entrypoint means the command silently does not exist, and a declared one on a
+        # cell without the LOD client half means the client dies at load on a missing class.
+        $cmdDeclared = (Get-Content $fmj -Raw) -match 'lod\.client\.CsLodClientCommandInit'
+        $cmdGated = ($hasLodClient -eq '1')
+        if ($cmdDeclared -and -not $cmdGated) {
+            throw "fabric.mod.json declares CsLodClientCommandInit but compat.has_lod_client is false for $Loader/$McVer -- the client would crash at load. Remove the entrypoint or widen the gate."
+        }
+        if ($cmdGated -and -not $cmdDeclared) {
+            throw "compat.has_lod_client is true for $Loader/$McVer but fabric.mod.json does not declare CsLodClientCommandInit -- /csclient would silently not exist. Add it to the 'client' entrypoints."
+        }
+    }
+}
+
+$lodDir = Join-Path $genJava 'com/kishku7/chunksmith/lod'
+if ($hasLod -eq '1') {
+    $lodSrc = Join-Path $cogSrc 'lod'
+    New-Item -ItemType Directory -Force -Path (Join-Path $lodDir 'net') | Out-Null
+
+    # Plain (name-stable) LOD sources.
+    $lodMap = [ordered]@{
+        'LodSupport.java'          = 'LodSupport.java'
+        'CsLodExtractor.java'      = 'CsLodExtractor.java'
+        'CsLodCommand.java'        = 'CsLodCommand.java'
+        'net/CsLodServerNet.java'  = 'net/CsLodServerNet.java'
+        'net/CsLodInBandSender.java' = 'net/CsLodInBandSender.java'
+    }
+    foreach ($name in $lodMap.Keys) {
+        $src = Join-Path $lodSrc $name
+        if (-not (Test-Path $src)) { throw "lod cog_source missing: $src" }
+        Copy-Item -Force $src (Join-Path $lodDir $lodMap[$name])
+    }
+
+    # Per-loader entrypoint + loader seam + per-era channel seam (conditional file presence).
+    $lodInitSrc = Join-Path $lodSrc ("LodInit_{0}.java" -f $Loader.ToLower())
+    if (-not (Test-Path $lodInitSrc)) { throw "lod entrypoint cog_source missing: $lodInitSrc" }
+    Copy-Item -Force $lodInitSrc (Join-Path $lodDir 'LodInit.java')
+
+    $lodPlatSrc = Join-Path $lodSrc ("LodPlatform_{0}.java" -f $Loader.ToLower())
+    if (-not (Test-Path $lodPlatSrc)) { throw "lod platform cog_source missing: $lodPlatSrc" }
+    Copy-Item -Force $lodPlatSrc (Join-Path $lodDir 'LodPlatform.java')
+
+    $lodChanSrc = Join-Path $lodSrc ("CsLodChannel_{0}.java" -f $lodNetEra)
+    if (-not (Test-Path $lodChanSrc)) { throw "lod channel cog_source missing: $lodChanSrc" }
+    Copy-Item -Force $lodChanSrc (Join-Path $lodDir 'net/CsLodChannel.java')
+
+    $cogTargets += (Join-Path $lodDir 'LodSupport.java')
+    $cogTargets += (Join-Path $lodDir 'CsLodExtractor.java')
+    $cogTargets += (Join-Path $lodDir 'CsLodCommand.java')
+    $cogTargets += (Join-Path $lodDir 'LodInit.java')
+    $cogTargets += (Join-Path $lodDir 'net/CsLodServerNet.java')
+
+    # --- legacy compat (4.0.0). One package, deleted whole when 3.x peers stop mattering.
+    # Server half: the /cslod stub that tells a 3.x client why its commands are gone.
+    $legacyDir = Join-Path $lodDir 'legacy'
+    New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
+    Copy-Item -Force (Join-Path $cogSrc 'lod/legacy/CsLodLegacyCommand.java') (Join-Path $legacyDir 'CsLodLegacyCommand.java')
+    $cogTargets += (Join-Path $legacyDir 'CsLodLegacyCommand.java')
+
+    # --- LOD horizon (4.4.0, mod_support #39). Past the horizon a pregen generates chunks only for their LOD
+    # and these vetoes drop them unsaved: chunk (ChunkMap.save), entities, POI, and the storage write itself
+    # as the backstop for C2ME's unload path. LOD cells only -- without an LOD store there is nothing to keep.
+    # The save shape per era comes from compat.horizon_save_era.
+    Copy-Item -Force (Join-Path $lodSrc 'HorizonGuard.java') (Join-Path $lodDir 'HorizonGuard.java')
+    # LOD from explored chunks (4.6.0) rides the same ChunkMap.save hook as the horizon veto.
+    Copy-Item -Force (Join-Path $lodSrc 'ExploredLodGuard.java') (Join-Path $lodDir 'ExploredLodGuard.java')
+    foreach ($hz in @('ChunkMapLevelAccessor.java', 'ChunkMapHorizonSaveMixin.java', 'EntityStorageHorizonMixin.java', 'SectionStorageHorizonMixin.java', 'StorageWriteHorizonMixin.java', 'ServerLevelExploredLodMixin.java')) {
+        $hzSrc = Join-Path $cogSrc $hz
+        if (-not (Test-Path $hzSrc)) { throw "horizon cog_source missing: $hzSrc" }
+        $hzDst = Join-Path $genJava (Join-Path $mixinPkg $hz)
+        Copy-Item -Force $hzSrc $hzDst
+        if ($hz -in @('ChunkMapHorizonSaveMixin.java', 'SectionStorageHorizonMixin.java', 'StorageWriteHorizonMixin.java')) {
+            $cogTargets += $hzDst
+        }
+    }
+    Write-Host "[cog-gen] + LOD horizon save vetoes (era $(& python -c "import sys; sys.path.insert(0, sys.argv[1]); import compat; sys.stdout.write(compat.horizon_save_era(sys.argv[2]))" $codegen $McVer))"
+    $cogTargets += (Join-Path $lodDir 'net/CsLodChannel.java')
+
+    # --- Renderer adapters (the SINGLEPLAYER injection path). Each behind its own gate. ---
+    if ($hasSectionBuilder -eq '1') {
+        Copy-Item -Force (Join-Path $lodSrc 'CsLodSectionBuilder.java') (Join-Path $lodDir 'CsLodSectionBuilder.java')
+        $cogTargets += (Join-Path $lodDir 'CsLodSectionBuilder.java')
+    }
+    if ($hasDh -eq '1') {
+        foreach ($f in @('CsLodDhSupport.java', 'CsLodDhGenerator.java', 'CsLodDhPusher.java')) {
+            $src = Join-Path $lodSrc $f
+            if (-not (Test-Path $src)) { throw "lod DH cog_source missing: $src" }
+            Copy-Item -Force $src (Join-Path $lodDir $f)
+        }
+        Write-Host "[cog-gen] + Distant Horizons adapter (DH ships a build for $Loader/$McVer)"
+    } else {
+        Write-Host "[cog-gen] - Distant Horizons adapter (no DH build for $Loader/$McVer)"
+    }
+    if ($hasVoxy -eq '1') {
+        foreach ($f in @('VoxyLodSink.java', 'CsLodVoxyInjector.java')) {
+            $src = Join-Path $lodSrc $f
+            if (-not (Test-Path $src)) { throw "lod voxy cog_source missing: $src" }
+            Copy-Item -Force $src (Join-Path $lodDir $f)
+        }
+        Write-Host "[cog-gen] + voxy adapter (voxy ships a build for $Loader/$McVer)"
+    } else {
+        Write-Host "[cog-gen] - voxy adapter (voxy is Fabric-only and has no build for $Loader/$McVer)"
+    }
+
+    # --- Step 4c: the LOD CLIENT half (compat.has_lod_client).
+    #
+    # This is the MULTIPLAYER path: on a Chunksmith server the player's own client downloads the
+    # pregenerated store (HTTP backchannel, or the in-band fallback) and injects it into whichever renderer
+    # they have. Until 3.1.0 it was a SEPARATE MOD, and the two mods BOTH registered the chunksmith:lod
+    # payload id -- so a player with both installed crashed on startup with "Packet type
+    # [id=chunksmith:lod] is already registered!". There is now ONE registration, in CsLodChannel, made from
+    # the COMMON init that runs on both sides. Everything below is RECEIVER-side only.
+    #
+    # SIDE GUARDING -- none of these classes may EVER load on a dedicated server. The guard is the LOADER's,
+    # not a runtime if:
+    #   Fabric   -- LodClientInit is a "client" entrypoint in fabric.mod.json. Fabric Loader does not
+    #               construct client entrypoints on a server.
+    #   NeoForge -- LodClientInit is a SECOND @Mod class, dist = Dist.CLIENT. FML only constructs a @Mod
+    #               class whose dist matches the running distribution.
+    #   Forge 47 -- @Mod has no dist there, so LodClientInit is a MOD-bus @EventBusSubscriber with
+    #               value = Dist.CLIENT. FML filters subscribers by dist BEFORE class-loading them.
+    # Proven at the gate by booting a dedicated server per loader with -verbose:class and asserting that no
+    # com.kishku7.chunksmith.lod.client class is ever loaded.
+    if ($hasLodClient -eq '1') {
+        $lodCliSrc = Join-Path $lodSrc 'client'
+        $lodCliDir = Join-Path $lodDir 'client'
+        New-Item -ItemType Directory -Force -Path (Join-Path $lodCliDir 'net') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $lodCliDir 'render') | Out-Null
+
+        # Name-stable client sources.
+        $cliMap = [ordered]@{
+            'CsLodClientBoot.java'       = 'CsLodClientBoot.java'
+            'CsLodDimension.java'        = 'CsLodDimension.java'
+            'Renderers.java'             = 'Renderers.java'
+            'net/CsLodClientNet.java'    = 'net/CsLodClientNet.java'
+            'render/DhPushGuard.java'    = 'render/DhPushGuard.java'
+            'render/DhRadius.java'       = 'render/DhRadius.java'
+            'render/DhTarget.java'       = 'render/DhTarget.java'
+            'render/LodInjector.java'    = 'render/LodInjector.java'
+        }
+        foreach ($name in $cliMap.Keys) {
+            $src = Join-Path $lodCliSrc $name
+            if (-not (Test-Path $src)) { throw "lod client cog_source missing: $src" }
+            $dst = Join-Path $lodCliDir $cliMap[$name]
+            Copy-Item -Force $src $dst
+            $cogTargets += $dst
+        }
+
+        # Per-era client platform facade + per-loader client entrypoint (conditional file presence).
+        $cliPlatSrc = Join-Path $lodCliSrc ("ClientPlatform_{0}.java" -f $lodNetEra)
+        if (-not (Test-Path $cliPlatSrc)) { throw "client platform cog_source missing: $cliPlatSrc" }
+        Copy-Item -Force $cliPlatSrc (Join-Path $lodCliDir 'ClientPlatform.java')
+        $cogTargets += (Join-Path $lodCliDir 'ClientPlatform.java')
+
+        $cliInitSrc = Join-Path $lodCliSrc ("LodClientInit_{0}.java" -f $Loader.ToLower())
+        if (-not (Test-Path $cliInitSrc)) { throw "client entrypoint cog_source missing: $cliInitSrc" }
+        Copy-Item -Force $cliInitSrc (Join-Path $lodCliDir 'LodClientInit.java')
+        $cogTargets += (Join-Path $lodCliDir 'LodClientInit.java')
+
+        # /csclient (4.0.0). Its own per-loader entrypoint rather than a branch inside LodClientInit:
+        # the registration APIs are unrelated (Fabric ClientCommandRegistrationCallback vs a game-bus
+        # RegisterClientCommandsEvent subscriber), and LodClientInit's Forge variant sits on the MOD
+        # bus while this one must be on the GAME bus. One file each keeps the bus choice visible.
+        $cmdInitSrc = Join-Path $lodCliSrc ("CsLodClientCommandInit_{0}.java" -f $Loader.ToLower())
+        if (-not (Test-Path $cmdInitSrc)) { throw "client command entrypoint cog_source missing: $cmdInitSrc" }
+        Copy-Item -Force $cmdInitSrc (Join-Path $lodCliDir 'CsLodClientCommandInit.java')
+        $cogTargets += (Join-Path $lodCliDir 'CsLodClientCommandInit.java')
+
+        Copy-Item -Force (Join-Path $lodCliSrc 'CsLodClientCommand.java') (Join-Path $lodCliDir 'CsLodClientCommand.java')
+        $cogTargets += (Join-Path $lodCliDir 'CsLodClientCommand.java')
+
+        # Client half of the legacy compat package: answers a 3.x server's /cslod set, which would
+        # otherwise hit an unknown message id and be dropped in silence.
+        $legacyCliDir = Join-Path $lodDir 'legacy'
+        New-Item -ItemType Directory -Force -Path $legacyCliDir | Out-Null
+        Copy-Item -Force (Join-Path $cogSrc 'lod/legacy/CsLodLegacySettings.java') (Join-Path $legacyCliDir 'CsLodLegacySettings.java')
+        $cogTargets += (Join-Path $legacyCliDir 'CsLodLegacySettings.java')
+
+        # voxy seam: the REAL adapter only where voxy actually ships (Fabric 1.21.11 + 26.x); a documented
+        # no-op stub everywhere else, so hasVoxy() returns false and the cell never announces a renderer it
+        # cannot feed. Unlike the SERVER-side voxy adapter (absent entirely off those cells), the client
+        # seam must exist on every LOD cell because Renderers references it unconditionally.
+        $voxySuffix = if ($hasVoxy -eq '1') { 'real' } else { 'stub' }
+        foreach ($base in @('VoxyTarget', 'VoxyRadius')) {
+            $src = Join-Path $lodCliSrc ("render/{0}_{1}.java" -f $base, $voxySuffix)
+            if (-not (Test-Path $src)) { throw "voxy seam cog_source missing: $src" }
+            $dst = Join-Path $lodCliDir ("render/{0}.java" -f $base)
+            Copy-Item -Force $src $dst
+            $cogTargets += $dst
+        }
+        Write-Host "[cog-gen] + LOD client voxy seam ($voxySuffix)"
+
+        # The DH dedupe-gate mixin. Only where DH exists -- and it must NOT go in chunksmith.mixins.json,
+        # which is "required": true. D18: Mixin resolves target classes at PREPARE time, and DH is an
+        # OPTIONAL soft dep, so a missing target in a REQUIRED config is a FATAL bootstrap error -- it would
+        # crash every voxy-only and every no-renderer player. Its own config, "required": false.
+        if ($hasDh -eq '1') {
+            New-Item -ItemType Directory -Force -Path (Join-Path $lodCliDir 'mixin') | Out-Null
+            $dst = Join-Path $lodCliDir 'mixin/DhClientLevelMixin.java'
+            Copy-Item -Force (Join-Path $lodCliSrc 'mixin/DhClientLevelMixin.java') $dst
+            $cogTargets += $dst
+        }
+
+        Write-Host "[cog-gen] + LOD CLIENT half (multiplayer download + inject)"
+    } else {
+        Write-Host "[cog-gen] - LOD CLIENT half (no LOD on this cell)"
+    }
+
+    Write-Host "[cog-gen] + LOD feature (net era = $lodNetEra)"
+} else {
+    if (Test-Path $lodDir) { Remove-Item -Recurse -Force $lodDir }
+    Write-Host "[cog-gen] - LOD feature (no client-side renderer exists for $Loader/$McVer)"
+}
+
+Push-Location $codegen
+try {
+    $env:PYTHONPATH = $codegen
+    & cog -r -D "mcver=$McVer" -D "loader=$Loader" @cogTargets
+    if ($LASTEXITCODE -ne 0) { throw "cog failed (exit $LASTEXITCODE)" }
+} finally {
+    Pop-Location
+}
+
+# --- Step 5b: ASSERT THE WORLD-ENTER ARMING PATH (mod_support #20) ---
+# The fabric.mod.json cross-check above proves the CLIENT entrypoint is declared. It says nothing
+# about the SERVER half, and the server half is what actually starts the run -- the client screen is
+# only ever reached because WorldEnterPregen.onServerStarted armed it.
+#
+# ROOT CASE (Chunksmith 3.18.0, 2026-09-04): the feature was ported to Forge 1.21.11 with ONLY the
+# client entrypoint. ChunksmithForge carried no ServerStartedEvent listener at all. It built green,
+# the jar contained every worldenter class, mods.toml was correct, Chunksmith loaded -- and the cell
+# logged NOTHING, not even the server-side world-enter line. That reads like a mod failing to load,
+# and it cost a full session to diagnose as one missing registration.
+#
+# So assert on the GENERATED loader main class, after cog has run:
+#   every loader          -- must CALL WorldEnterPregen.onServerStarted
+#   Forge on EventBus 7   -- must ALSO register the handler explicitly. There is no annotation scan
+#                            from Forge 56 on, so an unregistered @SubscribeEvent method is silent.
+if ($hasWorldEnter -eq '1') {
+    $mainByLoader = @{
+        'Fabric'   = 'ChunksmithFabric.java'
+        'NeoForge' = 'ChunksmithNeoForge.java'
+        'Forge'    = 'ChunksmithForge.java'
+    }
+    $mainName = $mainByLoader[$Loader]
+    $mainFile = Join-Path $genJava ('com/kishku7/chunksmith/' + $mainName)
+    if (-not (Test-Path $mainFile)) {
+        throw "world-enter is gated ON for $Loader/$McVer but the generated $mainName is missing -- cannot verify the arming path."
+    }
+    $mainText = Get-Content $mainFile -Raw
+    if ($mainText -notmatch 'WorldEnterPregen\.onServerStarted') {
+        throw "compat.has_world_enter is true for $Loader/$McVer but the generated $mainName never calls WorldEnterPregen.onServerStarted -- the server half would never arm and the screen would never open. Add the server-side hook to _codegen/cog_sources/$($mainName)."
+    }
+    if ($Loader -eq 'Forge' -and $forgeNewEventBus -eq '1' -and
+        $mainText -notmatch 'ServerStartedEvent\.BUS\.addListener') {
+        throw "Forge/$McVer is EventBus 7 (Forge 56+), which does NOT scan annotations: the generated ChunksmithForge.java declares the world-enter handler but never registers it with ServerStartedEvent.BUS.addListener, so it can never fire. Add the addListener line to the mod constructor."
+    }
+    Write-Host "[cog-gen] . world-enter arming path verified in $mainName"
+}
+
+# --- Step 6: rebuild chunksmith.mixins.json to match present files ---
+$mixinsJsonPath = Join-Path $cellPath 'src/main/resources/chunksmith.mixins.json'
+if (-not (Test-Path $mixinsJsonPath)) { throw "mixins json not found: $mixinsJsonPath" }
+
+# Enumerate mixin classes actually present in gen/ (server-side mixin dir, excluding client/).
+$presentMixins = Get-ChildItem -File (Join-Path $genJava $mixinPkg) |
+    Where-Object { $_.Extension -eq '.java' } |
+    ForEach-Object { $_.BaseName } |
+    Sort-Object
+
+$mixinsArray = ($presentMixins | ForEach-Object { "    `"$_`"" }) -join ",`n"
+
+# Classic-SRG Forge (ancient 1.20.1/1.20.4) needs a refmap key so the SpongePowered mixin loader
+# can resolve mojmap<->srg target names at runtime; every other loader/version omits it (a
+# stray refmap on a mojmap-native runtime would MISRESOLVE targets). forgeNeedsRefmap is only 1
+# when -Loader Forge AND compat.forge_needs_refmap(mcver) is true.
+$refmapLine = ''
+if ($Loader -eq 'Forge' -and $forgeNeedsRefmap -eq '1') {
+    $refmapLine = "  `"refmap`": `"chunksmith.refmap.json`",`n"
+    Write-Host "[cog-gen] + refmap key (classic-SRG Forge on $McVer)"
+} elseif ($Loader -eq 'Forge') {
+    Write-Host "[cog-gen] - refmap key (mojmap-native Forge on $McVer)"
+}
+
+$jsonText = @"
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.kishku7.chunksmith.mixin",
+  "compatibilityLevel": "$compatLevel",
+$($refmapLine)  "mixins": [
+$mixinsArray
+  ],
+  "client": [
+    "client.IntegratedServerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
+"@
+# ASCII, LF line endings.
+$jsonText = $jsonText -replace "`r`n", "`n"
+[System.IO.File]::WriteAllText($mixinsJsonPath, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
+
+Write-Host "[cog-gen] wrote $($presentMixins.Count) server mixins + client -> chunksmith.mixins.json (compat=$compatLevel)"
+
+# --- Step 7: the LOD-CLIENT mixin config -- a SEPARATE file, and it MUST stay "required": false (D18).
+#
+# Its one mixin targets Distant Horizons' internal DhClientLevel. DH is an OPTIONAL soft dependency.
+# Mixin resolves a config's target classes at PREPARE time, so on a client with no DH installed that
+# target does not exist -- and in a config marked "required": true a missing target is a FATAL bootstrap
+# error. It would take the game down for every voxy-only player and every player with no renderer at all,
+# both fully supported configurations. chunksmith.mixins.json is required:true (its targets are vanilla
+# and always present), so this mixin cannot live there. Hence a second config.
+#
+# The INJECTOR stays at defaultRequire 1: if DH IS present and shouldProcessChunkUpdate has moved, that is
+# a real breakage and it must be loud, not a silent no-op.
+$lodClientMixins = Join-Path $cellPath 'src/main/resources/chunksmith_lodclient.mixins.json'
+if ($hasLod -eq '1' -and $hasDh -eq '1') {
+    $lodClientJson = @"
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.kishku7.chunksmith.lod.client.mixin",
+  "compatibilityLevel": "$compatLevel",
+$($refmapLine)  "mixins": [],
+  "client": [
+    "DhClientLevelMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
+"@
+    $lodClientJson = $lodClientJson -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($lodClientMixins, $lodClientJson, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "[cog-gen] + chunksmith_lodclient.mixins.json (required=false, DH dedupe gate)"
+} else {
+    if (Test-Path $lodClientMixins) { Remove-Item -Force $lodClientMixins }
+    Write-Host "[cog-gen] - chunksmith_lodclient.mixins.json (no DH on this cell)"
+}
+
+Write-Host "[cog-gen] done: $genJava"

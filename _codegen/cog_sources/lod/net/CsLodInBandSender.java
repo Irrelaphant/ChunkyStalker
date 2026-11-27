@@ -1,0 +1,222 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.net;
+
+import net.minecraft.server.level.ServerPlayer;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * A few hundred KB/s, against the backchannel's ~55 MB/s. That is
+ * the point. This is the fallback for a server with no open
+ * backchannel port: region files sent IN-BAND, a few slices per
+ * tick.
+ *
+ * <p>Slow on purpose. It rides the same connection as gameplay,
+ * so every byte competes with movement, chunks and entities,
+ * while the backchannel moves its 55 MB/s with the game
+ * connection untouched. Hard cap of a few slices per tick, never
+ * a burst, and the client can stop it at any moment.
+ */
+public final class CsLodInBandSender {
+
+    /**
+     * Bytes per slice. Comfortably inside the packet ceiling, and
+     * small enough that one slice is never a spike in the middle
+     * of a tick.
+     */
+    private static final int SLICE_BYTES = 24 * 1024;
+
+    /**
+     * Slices per player per tick. 4 x 24 KB x 20 tps = ~1.9 MB/s:
+     * fast enough to be useful, slow enough that nobody's game
+     * stutters because someone else is fetching terrain.
+     */
+    private static final int SLICES_PER_TICK = 4;
+
+    private static final Map<UUID, Transfer> TRANSFERS = new ConcurrentHashMap<>();
+
+    private CsLodInBandSender() {
+    }
+
+    /**
+     * Queues a set of regions for a player. Replaces anything already queued for them.
+     *
+     * <p>Nothing is read here beyond the file list; the bytes are
+     * pulled a slice at a time in {@link #tick}, straight off
+     * disk. The obvious implementation, slurping every wanted
+     * region with {@code readAllBytes} and pre-slicing it, put
+     * the entire requested set on the heap, on the server thread,
+     * before a single byte went out: a legitimate client asking
+     * for a few hundred region files (a normal first join against
+     * a pregenerated world) is hundreds of megabytes and a
+     * multi-second main-thread stall, and a hostile one is a free
+     * OOM. A cursor costs one open file per player instead.
+     */
+    public static void queue(final ServerPlayer player, final Path storeRoot, final String dimension,
+                             final List<CsLodMessages.RegionEntry> wanted) throws IOException {
+        cancel(player);
+        Deque<Region> regions = new ArrayDeque<>();
+        for (CsLodMessages.RegionEntry entry : wanted) {
+            Path file = storeRoot.resolve(dimension)
+                    .resolve("r." + entry.regionX() + "." + entry.regionZ() + ".cslod");
+            if (!Files.isRegularFile(file)) {
+                continue;
+            }
+            regions.add(new Region(entry.regionX(), entry.regionZ(), file, Files.size(file)));
+        }
+        TRANSFERS.put(player.getUUID(), new Transfer(dimension, regions));
+    }
+
+    /** Drip-feed. Call once per server tick. */
+    public static void tick(ServerPlayer player) {
+        Transfer transfer = TRANSFERS.get(player.getUUID());
+        if (transfer == null) {
+            return;
+        }
+        try {
+            for (int i = 0; i < SLICES_PER_TICK; i++) {
+                if (!transfer.sendNext(player)) {
+                    finish(player.getUUID(), transfer);
+                    CsLodServerNet.sendTo(player, CsLodMessages.done());
+                    return;
+                }
+            }
+        } catch (IOException e) {
+            // A region vanished or the disk complained. Drop the transfer; the client re-asks.
+            finish(player.getUUID(), transfer);
+        }
+    }
+
+    /** The client asked us to stop. Stop. */
+    public static void cancel(ServerPlayer player) {
+        forget(player.getUUID());
+    }
+
+    public static void forget(UUID player) {
+        Transfer transfer = TRANSFERS.get(player);
+        if (transfer != null) {
+            finish(player, transfer);
+        }
+    }
+
+    private static void finish(UUID player, Transfer transfer) {
+        TRANSFERS.remove(player, transfer);
+        transfer.close();
+    }
+
+    /** Returns the status line's count of region files still to send across all players. */
+    public static int pending() {
+        return TRANSFERS.values().stream().mapToInt(Transfer::remaining).sum();
+    }
+
+    /** One region file still owed to a player. */
+    private record Region(int regionX, int regionZ, Path file, long size) {
+    }
+
+    /**
+     * A player's in-flight transfer: the regions still owed, plus
+     * a cursor into the one currently being sent. Touched only
+     * from the server thread (queue/tick/cancel all run there).
+     */
+    private static final class Transfer {
+
+        private final String dimension;
+        private final Deque<Region> pending;
+
+        private Region current;
+        private InputStream in;
+        private long sent;
+
+        private Transfer(String dimension, Deque<Region> pending) {
+            this.dimension = dimension;
+            this.pending = pending;
+        }
+
+        /**
+         * Sends at most one slice.
+         *
+         * @return false when there is nothing left to send
+         */
+        private boolean sendNext(ServerPlayer player) throws IOException {
+            if (this.in == null) {
+                this.current = this.pending.poll();
+                if (this.current == null) {
+                    return false;
+                }
+                this.in = Files.newInputStream(this.current.file());
+                this.sent = 0L;
+            }
+
+            byte[] buffer = new byte[SLICE_BYTES];
+            // readNBytes only stops short at EOF, so a short read IS the end of the file, which also
+            // covers a region the writer thread replaced underneath us.
+            int read = this.in.readNBytes(buffer, 0, SLICE_BYTES);
+            if (read <= 0) {
+                closeCurrent();
+                return true;
+            }
+            this.sent += read;
+            boolean last = read < SLICE_BYTES || this.sent >= this.current.size();
+            byte[] data = read == SLICE_BYTES ? buffer : Arrays.copyOf(buffer, read);
+
+            CsLodServerNet.sendTo(player, CsLodMessages.encode(new CsLodMessages.RegionSlice(
+                    this.dimension, this.current.regionX(), this.current.regionZ(), last, data)));
+
+            if (last) {
+                closeCurrent();
+            }
+            return true;
+        }
+
+        private int remaining() {
+            return this.pending.size() + (this.current == null ? 0 : 1);
+        }
+
+        private void closeCurrent() {
+            if (this.in != null) {
+                try {
+                    this.in.close();
+                } catch (IOException ignored) {
+                    // Closing a read-only stream. Nothing useful to do, and nothing at stake.
+                }
+                this.in = null;
+            }
+            this.current = null;
+        }
+
+        private void close() {
+            this.pending.clear();
+            closeCurrent();
+        }
+    }
+}

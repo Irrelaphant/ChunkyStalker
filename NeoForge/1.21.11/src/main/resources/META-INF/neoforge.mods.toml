@@ -1,0 +1,74 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="GNU GPLv3"
+issueTrackerURL="https://github.com/Kishku7/mod_support/issues"
+[[mods]]
+modId="${id}"
+version="${version}"
+displayName="${name}"
+displayURL="${github}"
+logoFile="icon.png"
+authors="${author}, pop4959"
+description="${description}"
+[[mixins]]
+config="chunksmith.mixins.json"
+[[mixins]]
+config="chunksmith_lodclient.mixins.json"
+[[dependencies.${id}]]
+   modId="neoforge"
+   type="required"
+   versionRange="${neoforgeRange}"
+   ordering="NONE"
+   side="BOTH"
+[[dependencies.${id}]]
+   modId="minecraft"
+   type="required"
+   versionRange="${mcRange}"
+   ordering="NONE"
+   side="BOTH"
+
+# LOD-streamer conflicts. Each of these ALSO streams LOD data into a client's voxy/Distant Horizons
+# database over its own wire, while Chunksmith serves CSLOD over ours. Two writers, one database, no
+# coordination: duplicated download, duplicated ingest, and a real risk of racing voxy's DB-local id
+# allocation. Ids CONFIRMED by reading the published jars, 2026-07-12.
+# distanthorizons is deliberately NOT here -- it is a renderer we FEED, not a competitor.
+# Distant Horizons -- OPTIONAL, and a renderer we FEED (see the incompatible list below for the mods we
+# actually conflict with). Chunksmith works perfectly well without it. The floor is the oldest DH whose
+# public API carries everything we call; there is NO upper bound, because DH's core/ + api/ trees are
+# byte-identical across MC lines and every API method we use has been signature-stable since DH 2.0.0-a.
+# A DH outside that range degrades -- CsLodDhSupport catches the LinkageError, disables DH for the session
+# and says so in the log -- it does not crash the server.
+[[dependencies.${id}]]
+   modId="distanthorizons"
+   type="optional"
+   versionRange="[2.3.0-b,)"
+   ordering="AFTER"
+   side="BOTH"
+
+[[dependencies.${id}]]
+   modId="lss"
+   type="incompatible"
+   versionRange="[0,)"
+   ordering="NONE"
+   side="BOTH"
+[[dependencies.${id}]]
+   modId="voxyserver"
+   type="incompatible"
+   versionRange="[0,)"
+   ordering="NONE"
+   side="BOTH"
+[[dependencies.${id}]]
+   modId="lodserver"
+   type="incompatible"
+   versionRange="[0,)"
+   ordering="NONE"
+   side="BOTH"
+
+# ChunkyStalker is a fork of Chunksmith and ships the same Java packages. Both in one instance would
+# collide on every class, so refuse it up front with a readable message instead.
+[[dependencies.${id}]]
+   modId="chunksmith"
+   type="incompatible"
+   versionRange="[0,)"
+   ordering="NONE"
+   side="BOTH"

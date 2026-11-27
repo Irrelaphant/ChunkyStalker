@@ -1,0 +1,1079 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.platform.impl;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.kishku7.chunksmith.platform.Config;
+import com.kishku7.chunksmith.platform.ServerEnvironment;
+import com.kishku7.chunksmith.platform.LodMode;
+import com.kishku7.chunksmith.util.Input;
+import com.kishku7.chunksmith.worldenter.WorldEnterCenter;
+import com.kishku7.chunksmith.worldenter.WorldEnterDimensions;
+import com.kishku7.chunksmith.worldenter.WorldEnterShape;
+import com.kishku7.chunksmith.util.Translator;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.util.Locale;
+
+public final class GsonConfig implements Config {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    // slf4j, not java.util.logging. The loaders do not route JUL to the game log, so every one
+    // of the range warnings below was invisible to operators: a config value silently clamped
+    // with the explanation going nowhere. Same bug class that hid the drain diagnostics until
+    // ChunkResidency was switched over.
+    private static final Logger LOGGER = LoggerFactory.getLogger("Chunksmith");
+    // Target ms/tick the throttle steers toward. A healthy 20 TPS server measures ~50 ms,
+    // so the floor of this range is 50; the default leaves a small margin above it.
+    private static final double TARGET_MSPT_MIN = 54.0;
+    private static final double TARGET_MSPT_MAX = 1000.0;
+    private static final double TARGET_MSPT_DEFAULT = 150.0;
+    // Absolute per-chunk latency backstop (ms).
+    private static final long MAX_CHUNK_MILLIS_MIN = 100L;
+    private static final long MAX_CHUNK_MILLIS_MAX = 60_000L;
+    private static final long MAX_CHUNK_MILLIS_DEFAULT = 750L;
+    // Maximum queued (unflushed) chunk writes before generation dispatch is held off.
+    // 0 disables. Hysteresis resumes dispatch once the backlog drains to half this value.
+    private static final long MAX_QUEUED_WRITES_MIN = 50L;
+    private static final long MAX_QUEUED_WRITES_MAX = 1_000_000L;
+    private static final long MAX_QUEUED_WRITES_DEFAULT = 800L;
+    // Maximum chunks a run may add to the resident set before dispatch is held off. 0 disables.
+    // Measured as a delta against residency at task start (3.5.1); the 3.5.0 absolute form tripped on
+    // whatever the server already had. A legitimate sweep frontier is roughly 16x the selection radius
+    // in chunks, so 20000 clears a ~1200-chunk-radius run untouched, while the runaway this bounds
+    // added ~55000 over baseline on a 470-chunk-radius selection. Hysteresis resumes dispatch at half.
+    private static final long MAX_ADDED_CHUNKS_MIN = 1_000L;
+    private static final long MAX_ADDED_CHUNKS_MAX = 5_000_000L;
+    // Default 0 (off) as of 3.5.5. A chunk count cannot be tuned to mean the same thing on two
+    // worlds. A chunk is worth wildly different amounts of heap depending on the entities and block
+    // entities that came with it, and on a live server this gate closed at 22,000 chunks while the
+    // heap sat at 40 percent, stuttering a perfectly healthy run to 60 chunks per two minutes. Memory
+    // is governed by throttleMaxHeapPercent and load by tick health; this stays as an expert knob.
+    private static final long MAX_ADDED_CHUNKS_DEFAULT = 0L;
+    // Heap ceiling, as a percentage of -Xmx, above which dispatch is held. 0 disables. 85 leaves the
+    // collector room to work while still stopping well short of the thrash that precedes an OOM.
+    private static final long MAX_HEAP_PERCENT_MIN = 50L;
+    private static final long MAX_HEAP_PERCENT_MAX = 99L;
+    private static final long MAX_HEAP_PERCENT_DEFAULT = 85L;
+    // Auto-pause: how long the server must hold a state before the run is stopped or restarted.
+    // 120 s is long enough to ride out an autosave or a structure-heavy patch of terrain, and short
+    // enough that an operator watching a stalled run does not sit through many minutes of stutter.
+    private static final int AUTO_PAUSE_GRACE_MIN = 10;
+    private static final int AUTO_PAUSE_GRACE_MAX = 3600;
+    private static final int AUTO_PAUSE_GRACE_DEFAULT = 120;
+    // How much tick time a pre-gen may add on top of whatever the server already costs. See
+    // Config#getThrottleTickBudgetMillis: an absolute target is unusable on a server whose idle
+    // baseline already sits at it. 25 ms is a quarter of a 100 ms tick and was measured to be more
+    // than the whole run was costing (10 ms) on the server that exposed this.
+    private static final long TICK_BUDGET_MIN = 5L;
+    private static final long TICK_BUDGET_MAX = 500L;
+    private static final long TICK_BUDGET_DEFAULT = 25L;
+    // Reserved per online player, taken out of our allowance. 20 ms is roughly double what a player
+    // was measured to cost, matching the "twice the measured cost" rule used for our own budget.
+    private static final long PLAYER_RESERVE_MIN = 0L;
+    private static final long PLAYER_RESERVE_MAX = 200L;
+    private static final long PLAYER_RESERVE_DEFAULT = 20L;
+    // Absolute playability ceiling. 150 ms is ~6.7 TPS: slow, but a server you can still be on.
+    // Vanilla's own target is 50 ms, so this already grants a pre-gen three times the normal budget.
+    private static final long CEILING_MIN = 60L;
+    private static final long CEILING_MAX = 2000L;
+    private static final long CEILING_DEFAULT = 150L;
+    // Governor for the LOD sink. Voxy's ingest queue is unbounded and never reports saturation, so
+    // this is the only thing standing between a fast pregen and an OOM.
+    private static final long MAX_LOD_QUEUE_MIN = 16L;
+    private static final long MAX_LOD_QUEUE_MAX = 100_000L;
+    private static final long MAX_LOD_QUEUE_DEFAULT = 512L;
+
+    // 0 means "governor only", which is exactly what every release before 4.0.0 did. The barrier is
+    // opt-in because it LOSES on a machine with spare cores -- it idles them while the renderer
+    // drains -- and the two numbers that would make a sensible default have not been measured yet.
+    private static final long LOD_DRAIN_TO_DEFAULT = 0L;
+    private static final long DISPATCH_MAX_CONCURRENT_MIN = 1L;
+    private static final long DISPATCH_MAX_CONCURRENT_MAX = 4096L;
+    /**
+     * Smallest pipeline width the default may choose. Historically 50, held there so no machine
+     * got slower than it had been; 8 now, because with the controller converging properly the
+     * floor is no longer what protects a small box.
+     */
+    private static final long DISPATCH_FLOOR = 8L;
+    /**
+     * The pipeline knee: chunks in flight past which more does not help, and eventually hurts.
+     *
+     * <p>MEASURED TWICE, on machines four core-counts apart, and it did not move:
+     * <ul>
+     *   <li>8-core dedicated: 50 -> 31.6 cps, <b>200 -> 43.9</b>, 600 -> 42.4.</li>
+     *   <li>2-core dedicated (2026-09-14, 625 chunks, every JVM thread pinned to two cores):
+     *       8 -> 15.6, 16 -> 17.7, 24 -> 19.5, 50 -> 16.9, 100 -> 21.5, <b>200 -> 29.8</b>,
+     *       400 -> about 25 and visibly bursting then stalling.</li>
+     * </ul>
+     *
+     * <p><b>This is why the default is no longer scaled by core count.</b> It used to be
+     * {@code cores * 25}, which gives 200 on 8 cores and looked right because that is the machine
+     * it was measured on. On two cores the same formula gives 50 -- and 50 measured at 16.9 cps
+     * against 29.8 at 200, so the "scaling" was costing a small machine <b>43 percent of its
+     * throughput</b> in the name of protecting it.
+     *
+     * <p>The reason it does not scale is in {@link Config#getDispatchMaxConcurrent()}: a chunk
+     * request spends almost all of its life WAITING, because vanilla walks it up its generation
+     * statuses about a hop per tick. Width buys concurrency against latency, not against CPU, and
+     * latency does not shrink when you remove cores.
+     *
+     * <p>Above the knee it does not merely stop helping: the 400 arm generated in bursts and then
+     * stalled, which is the pattern a reporter described on mod_support #20 and #33. The
+     * controller in GenerationTask caught it -- it halved 396 to 197 and then to 95 -- but the
+     * cheaper fix is not to start above the knee.
+     */
+    private static final long DISPATCH_KNEE = Config.DISPATCH_MAX_CONCURRENT_DEFAULT;
+
+    /**
+     * Default pipeline width.
+     *
+     * <p>The {@code chunksmith.maxWorkingCount} system property still wins when set, so an
+     * operator who already tuned this on the command line is never silently overridden.
+     *
+     * <p>A CLIENT gets the same number, and that was MEASURED rather than assumed. On a 4-core
+     * client under {@code taskset} with voxy and Sodium loaded, 16640 chunks, arms interleaved:
+     * <ul>
+     *   <li>width 200: 275s and 298s, worst pause 6.0s both times.</li>
+     *   <li>width 16: 458s and 379s, worst pause 20.9s and 16.4s.</li>
+     * </ul>
+     * Narrowing the pipeline cost 46 percent of throughput AND tripled the worst stall; mean and
+     * p90 gaps were identical. The expectation going in was that a narrow pipeline trades speed
+     * for smoothness on a machine that is also rendering. It does not -- it loses both.
+     *
+     * <p>What that does NOT settle: the bench rig has 4 cores but a fast GPU, and the reporter on
+     * mod_support #33 has an i3-7100 with integrated graphics, which is exactly the variable that
+     * differs most. His hand-tuned 16 may still help HIM. It is not evidence for a DEFAULT.
+     * {@link ServerEnvironment} stays live and {@code /cs debug} reports which side it is on, so
+     * the seam is there if a client ever earns its own curve.
+     *
+     * @return the default number of chunks to keep in flight
+     */
+    private static long dispatchMaxConcurrentDefault() {
+        Optional<Integer> override = Input.tryInteger(System.getProperty("chunksmith.maxWorkingCount"));
+        if (override.isPresent()) {
+            return override.get().longValue();
+        }
+        return Math.max(DISPATCH_FLOOR, DISPATCH_KNEE);
+    }
+    // 0 means no ceiling; 2048 is the default. An upper bound exists only so a typo cannot store a
+    // number that overflows when multiplied up to bytes; it is not a recommendation.
+    // 4096 blocks = 256 chunks: what DH and voxy draw untouched. See Config#getWorldEnterPregenRadius.
+    private static final long WORLD_ENTER_RADIUS_DEFAULT = 4096L;
+    private static final long WORLD_ENTER_RADIUS_MIN = 128L;
+    private static final long WORLD_ENTER_RADIUS_MAX = 32768L;
+
+    private static final long LOD_INDEX_BUDGET_MB_NONE = 0L;
+    private static final long LOD_INDEX_BUDGET_MB_MAX = 1L << 20;   // a terabyte, in megabytes
+
+    private static final long SETTLE_DELAY_DEFAULT = 40L;
+    private static final long SETTLE_DELAY_MAX = 600L;
+    private static final int SETTLE_RADIUS_DEFAULT = 7;
+    private static final int SETTLE_RADIUS_MAX = 16;
+    // Hard ceiling on the settle frontier, counted in tickets -- but paid for in tickets x halo. A ticket
+    // held at FULL level does not hold one chunk: vanilla's distance manager propagates the level outward
+    // a ring at a time, so roughly 25 resident chunks come with each held ticket at pre-gen clustering.
+    // ChunkSettleWindow carries that measurement.
+    //
+    // The 3.5.0 default of 8192 therefore authorised something like 200,000 resident chunks, and 3.4.1,
+    // which had no cap at all, is how a live server ran itself into the watchdog (see ChunkResidency).
+    // 256 is about 6,000 resident chunks on that measurement, which an 8 GB heap carries comfortably.
+    // Raise it only with that arithmetic in mind.
+    private static final long SETTLE_MAX_HELD_MIN = 16L;
+    private static final long SETTLE_MAX_HELD_MAX = 1_000_000L;
+    private static final long SETTLE_MAX_HELD_DEFAULT = 256L;
+    // The LOD backchannel port. 0 = derive it from the game port (gamePort + 1), which is what
+    // Chunksmith did unconditionally before 3.14.0 and remains the default. An explicit value is
+    // floored at 1024 because binding a privileged port is not something a game server should be
+    // asking for, and a value below it is far more likely to be a typo than an intention.
+    private static final int BACKCHANNEL_PORT_DERIVE = 0;
+    private static final int BACKCHANNEL_PORT_MIN = 1024;
+    private static final int BACKCHANNEL_PORT_MAX = 65535;
+    private final Path savePath;
+    private ConfigModel configModel = new ConfigModel();
+
+    public GsonConfig(Path savePath) {
+        this.savePath = savePath;
+        if (Files.exists(this.savePath)) {
+            reload();
+        } else {
+            saveConfig();
+        }
+        Translator.setLanguage(getLanguage());
+    }
+
+    @Override
+    public Path getDirectory() {
+        return savePath.getParent();
+    }
+
+    @Override
+    public int getVersion() {
+        return Optional.ofNullable(configModel.version).orElse(0);
+    }
+
+    @Override
+    public String getLanguage() {
+        return Optional.ofNullable(configModel.language).map(Input::checkLanguage).orElse("en");
+    }
+
+    @Override
+    public boolean getContinueOnRestart() {
+        return Optional.ofNullable(configModel.continueOnRestart).orElse(false);
+    }
+
+    @Override
+    public boolean isForceLoadExistingChunks() {
+        return Optional.ofNullable(configModel.forceLoadExistingChunks).orElse(false);
+    }
+
+    @Override
+    public boolean isSilent() {
+        return Optional.ofNullable(configModel.silent).orElse(false);
+    }
+
+    @Override
+    public void setSilent(boolean silent) {
+        configModel.silent = silent;
+        saveConfig();
+    }
+
+    @Override
+    public int getUpdateInterval() {
+        return Optional.ofNullable(configModel.updateInterval).orElse(1);
+    }
+
+    @Override
+    public void setUpdateInterval(int updateInterval) {
+        configModel.updateInterval = Math.max(0, updateInterval);
+        saveConfig();
+    }
+
+    @Override
+    public boolean isIoThrottleEnabled() {
+        return Optional.ofNullable(configModel.ioThrottle).orElse(true);
+    }
+
+    @Override
+    public double getThrottleTargetMspt() {
+        double raw = Optional.ofNullable(configModel.throttleTargetMspt).orElse(TARGET_MSPT_DEFAULT);
+        double clamped = Math.max(TARGET_MSPT_MIN, Math.min(TARGET_MSPT_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleTargetMspt %.1f is out of range [%.1f, %.1f], using %.1f",
+                    raw, TARGET_MSPT_MIN, TARGET_MSPT_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleMaxChunkMillis() {
+        long raw = Optional.ofNullable(configModel.throttleMaxChunkMillis).orElse(MAX_CHUNK_MILLIS_DEFAULT);
+        long clamped = Math.max(MAX_CHUNK_MILLIS_MIN, Math.min(MAX_CHUNK_MILLIS_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleMaxChunkMillis %d is out of range [%d, %d], using %d",
+                    raw, MAX_CHUNK_MILLIS_MIN, MAX_CHUNK_MILLIS_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleMaxQueuedWrites() {
+        long raw = Optional.ofNullable(configModel.throttleMaxQueuedWrites).orElse(MAX_QUEUED_WRITES_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(MAX_QUEUED_WRITES_MIN, Math.min(MAX_QUEUED_WRITES_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleMaxQueuedWrites %d is out of range [%d, %d], using %d",
+                    raw, MAX_QUEUED_WRITES_MIN, MAX_QUEUED_WRITES_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleMaxAddedChunks() {
+        long raw = Optional.ofNullable(configModel.throttleMaxAddedChunks).orElse(MAX_ADDED_CHUNKS_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(MAX_ADDED_CHUNKS_MIN, Math.min(MAX_ADDED_CHUNKS_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleMaxAddedChunks %d is out of range [%d, %d], using %d",
+                    raw, MAX_ADDED_CHUNKS_MIN, MAX_ADDED_CHUNKS_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleMaxHeapPercent() {
+        long raw = Optional.ofNullable(configModel.throttleMaxHeapPercent).orElse(MAX_HEAP_PERCENT_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(MAX_HEAP_PERCENT_MIN, Math.min(MAX_HEAP_PERCENT_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleMaxHeapPercent %d is out of range [%d, %d], using %d",
+                    raw, MAX_HEAP_PERCENT_MIN, MAX_HEAP_PERCENT_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public boolean isAutoPauseEnabled() {
+        return Optional.ofNullable(configModel.autoPauseOnOverload).orElse(true);
+    }
+
+    @Override
+    public int getAutoPauseGraceSeconds() {
+        int raw = Optional.ofNullable(configModel.autoPauseGraceSeconds).orElse(AUTO_PAUSE_GRACE_DEFAULT);
+        int clamped = Math.max(AUTO_PAUSE_GRACE_MIN, Math.min(AUTO_PAUSE_GRACE_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: autoPauseGraceSeconds %d is out of range [%d, %d], using %d",
+                    raw, AUTO_PAUSE_GRACE_MIN, AUTO_PAUSE_GRACE_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleTickBudgetMillis() {
+        long raw = Optional.ofNullable(configModel.throttleTickBudgetMillis).orElse(TICK_BUDGET_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(TICK_BUDGET_MIN, Math.min(TICK_BUDGET_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleTickBudgetMillis %d is out of range [%d, %d], using %d",
+                    raw, TICK_BUDGET_MIN, TICK_BUDGET_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottlePlayerReserveMillis() {
+        long raw = Optional.ofNullable(configModel.throttlePlayerReserveMillis).orElse(PLAYER_RESERVE_DEFAULT);
+        long clamped = Math.max(PLAYER_RESERVE_MIN, Math.min(PLAYER_RESERVE_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttlePlayerReserveMillis %d is out of range [%d, %d], using %d",
+                    raw, PLAYER_RESERVE_MIN, PLAYER_RESERVE_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleCeilingMillis() {
+        long raw = Optional.ofNullable(configModel.throttleCeilingMillis).orElse(CEILING_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(CEILING_MIN, Math.min(CEILING_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleCeilingMillis %d is out of range [%d, %d], using %d",
+                    raw, CEILING_MIN, CEILING_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public LodMode getLodMode() {
+        String raw = configModel.lodEnabled;
+        LodMode mode = LodMode.parse(raw);
+        if (mode == null) {
+            LOGGER.warn("Chunksmith: lodEnabled '" + raw
+                    + "' is not one of auto/true/false, using auto");
+            return LodMode.AUTO;
+        }
+        return mode;
+    }
+
+    @Override
+    public long getThrottleMaxLodQueue() {
+        long raw = Optional.ofNullable(configModel.throttleMaxLodQueue).orElse(MAX_LOD_QUEUE_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(MAX_LOD_QUEUE_MIN, Math.min(MAX_LOD_QUEUE_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: throttleMaxLodQueue %d is out of range [%d, %d], using %d",
+                    raw, MAX_LOD_QUEUE_MIN, MAX_LOD_QUEUE_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getThrottleLodDrainTo() {
+        long raw = Optional.ofNullable(configModel.throttleLodDrainTo).orElse(LOD_DRAIN_TO_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        // Must sit BELOW the high-water mark or the barrier releases the instant it engages and the
+        // whole thing is an expensive no-op. Clamped rather than refused: a config that disagrees with
+        // itself should still run.
+        long ceiling = getThrottleMaxLodQueue();
+        if (ceiling > 0L && raw >= ceiling) {
+            long clamped = Math.max(1L, ceiling / 2L);
+            LOGGER.warn(String.format("Chunksmith: throttleLodDrainTo %d is not below throttleMaxLodQueue"
+                    + " %d, using %d", raw, ceiling, clamped));
+            return clamped;
+        }
+        return raw;
+    }
+
+    @Override
+    public long getDispatchMaxConcurrent() {
+        long raw = Optional.ofNullable(configModel.dispatchMaxConcurrent)
+                .orElseGet(GsonConfig::dispatchMaxConcurrentDefault);
+        long clamped = Math.max(DISPATCH_MAX_CONCURRENT_MIN,
+                Math.min(DISPATCH_MAX_CONCURRENT_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format(
+                    "Chunksmith: dispatchMaxConcurrent %d is out of range [%d, %d], using %d",
+                    raw, DISPATCH_MAX_CONCURRENT_MIN, DISPATCH_MAX_CONCURRENT_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public boolean isPregenSettleEnabled() {
+        return Optional.ofNullable(configModel.pregenSettle).orElse(true);
+    }
+
+    @Override
+    public long getPregenSettleDelayTicks() {
+        long raw = Optional.ofNullable(configModel.pregenSettleDelayTicks)
+                .orElse(SETTLE_DELAY_DEFAULT);
+        long clamped = Math.max(0L, Math.min(SETTLE_DELAY_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: pregenSettleDelayTicks %d is out of range [0, %d],"
+                    + " using %d", raw, SETTLE_DELAY_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public long getPregenSettleMaxHeld() {
+        long raw = Optional.ofNullable(configModel.pregenSettleMaxHeld).orElse(SETTLE_MAX_HELD_DEFAULT);
+        if (raw <= 0L) {
+            return 0L;
+        }
+        long clamped = Math.max(SETTLE_MAX_HELD_MIN, Math.min(SETTLE_MAX_HELD_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: pregenSettleMaxHeld %d is out of range [%d, %d], using %d",
+                    raw, SETTLE_MAX_HELD_MIN, SETTLE_MAX_HELD_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public int getPregenSettleRadius() {
+        int raw = Optional.ofNullable(configModel.pregenSettleRadius).orElse(SETTLE_RADIUS_DEFAULT);
+        int clamped = Math.max(1, Math.min(SETTLE_RADIUS_MAX, raw));
+        if (raw != clamped) {
+            LOGGER.warn(String.format("Chunksmith: pregenSettleRadius %d is out of range [1, %d],"
+                    + " using %d", raw, SETTLE_RADIUS_MAX, clamped));
+        }
+        return clamped;
+    }
+
+    @Override
+    public void setPregenSettleEnabled(boolean enabled) {
+        configModel.pregenSettle = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public void setPregenSettleDelayTicks(long ticks) {
+        // Clamp on the way in as well as the way out. The getter clamps because a hand-edited file can
+        // hold anything; doing it here too means the file never contains a value we would refuse to read
+        // back, so what /cs settle reports and what the file says can never disagree.
+        configModel.pregenSettleDelayTicks = Math.max(0L, Math.min(SETTLE_DELAY_MAX, ticks));
+        saveConfig();
+    }
+
+    @Override
+    public void setPregenSettleRadius(int radius) {
+        configModel.pregenSettleRadius = Math.max(1, Math.min(SETTLE_RADIUS_MAX, radius));
+        saveConfig();
+    }
+
+    @Override
+    public boolean isLodDhOverrideEnabled() {
+        return Optional.ofNullable(configModel.lodDhOverride).orElse(false);
+    }
+
+    @Override
+    public boolean isLodFromExploredChunksEnabled() {
+        // A config written before 4.6.0 has no key, and reads the default: on.
+        return Optional.ofNullable(configModel.lodFromExploredChunks).orElse(true);
+    }
+
+    @Override
+    public int getLodBackchannelPort() {
+        int raw = Optional.ofNullable(configModel.lodBackchannelPort).orElse(BACKCHANNEL_PORT_DERIVE);
+        if (raw == BACKCHANNEL_PORT_DERIVE) {
+            return BACKCHANNEL_PORT_DERIVE;
+        }
+        if (raw < BACKCHANNEL_PORT_MIN || raw > BACKCHANNEL_PORT_MAX) {
+            // Say it out loud. A silently corrected port is the worst outcome here: the operator
+            // opens the number they wrote in the file and the server is listening somewhere else.
+            LOGGER.warn("Chunksmith: lodBackchannelPort " + raw + " is outside "
+                    + BACKCHANNEL_PORT_MIN + "-" + BACKCHANNEL_PORT_MAX
+                    + "; deriving the port from the game port instead");
+            return BACKCHANNEL_PORT_DERIVE;
+        }
+        return raw;
+    }
+
+    @Override
+    public long getLodIndexBudgetMb() {
+        long raw = Optional.ofNullable(configModel.lodIndexBudgetMb).orElse(LOD_INDEX_BUDGET_MB_DEFAULT);
+        if (raw <= LOD_INDEX_BUDGET_MB_NONE) {
+            // Negative is not a smaller budget than zero, it is a typo. Both mean no ceiling here,
+            // which is also what an operator who never touched the key gets.
+            return LOD_INDEX_BUDGET_MB_NONE;
+        }
+        if (raw > LOD_INDEX_BUDGET_MB_MAX) {
+            LOGGER.warn("Chunksmith: lodIndexBudgetMb " + raw + " is above " + LOD_INDEX_BUDGET_MB_MAX
+                    + " MB; serving without a budget instead");
+            return LOD_INDEX_BUDGET_MB_NONE;
+        }
+        return raw;
+    }
+
+    @Override
+    public boolean isWorldEnterPregenEnabled() {
+        return Optional.ofNullable(configModel.worldEnterPregen).orElse(true);
+    }
+
+    @Override
+    public boolean isWorldEnterPregenSupported() {
+        // The mod runs on both sides; the integrated-server check that decides whether there is a
+        // world-entry moment at all belongs to the caller, not to config storage.
+        return true;
+    }
+
+    @Override
+    public long getWorldEnterPregenRadius() {
+        long raw = Optional.ofNullable(configModel.worldEnterPregenRadius)
+                .orElse(WORLD_ENTER_RADIUS_DEFAULT);
+        if (raw < WORLD_ENTER_RADIUS_MIN || raw > WORLD_ENTER_RADIUS_MAX) {
+            LOGGER.warn("Chunksmith: worldEnterPregenRadius " + raw + " is outside "
+                    + WORLD_ENTER_RADIUS_MIN + "-" + WORLD_ENTER_RADIUS_MAX
+                    + "; using " + WORLD_ENTER_RADIUS_DEFAULT + " instead");
+            return WORLD_ENTER_RADIUS_DEFAULT;
+        }
+        return raw;
+    }
+
+    @Override
+    public long getWorldEnterLodHorizon() {
+        long raw = Optional.ofNullable(configModel.worldEnterLodHorizon).orElse(0L);
+        return Math.max(0L, Math.min(WORLD_ENTER_RADIUS_MAX, raw));
+    }
+
+    @Override
+    public String getWorldEnterPregenCenter() {
+        String raw = Optional.ofNullable(configModel.worldEnterPregenCenter)
+                .orElse(WorldEnterCenter.DEFAULT);
+        WorldEnterCenter parsed = WorldEnterCenter.parse(raw);
+        if (parsed == null) {
+            // Same posture as the radius above: say what was wrong and what is being used instead,
+            // rather than silently substituting a value the operator never sees.
+            LOGGER.warn("Chunksmith: worldEnterPregenCenter \"" + raw + "\" is not 'auto', 'origin',"
+                    + " 'spawn' or 'x,z'; using " + WorldEnterCenter.DEFAULT + " instead");
+            return WorldEnterCenter.DEFAULT;
+        }
+        return parsed.spec();
+    }
+
+    @Override
+    public String getWorldEnterPregenShape() {
+        String raw = Optional.ofNullable(configModel.worldEnterPregenShape).orElse(WorldEnterShape.DEFAULT);
+        String parsed = WorldEnterShape.parse(raw);
+        if (parsed == null) {
+            LOGGER.warn("Chunksmith: worldEnterPregenShape \"" + raw + "\" is not one of "
+                    + String.join(", ", WorldEnterShape.ALL) + "; using " + WorldEnterShape.DEFAULT + " instead");
+            return WorldEnterShape.DEFAULT;
+        }
+        return parsed;
+    }
+
+    @Override
+    public String getWorldEnterPregenDimensions() {
+        String raw = Optional.ofNullable(configModel.worldEnterPregenDimensions)
+                .orElse(WorldEnterDimensions.DEFAULT);
+        var parsed = WorldEnterDimensions.parse(raw);
+        if (parsed == null) {
+            LOGGER.warn("Chunksmith: worldEnterPregenDimensions \"" + raw + "\" is not 'overworld', 'nether',"
+                    + " 'end', a comma-separated mix of them, or 'all'; using " + WorldEnterDimensions.DEFAULT
+                    + " instead");
+            return WorldEnterDimensions.DEFAULT;
+        }
+        return WorldEnterDimensions.spec(parsed);
+    }
+
+    @Override
+    public String getLodBackchannelBindAddress() {
+        return Input.checkHost(configModel.lodBackchannelBindAddress);
+    }
+
+    @Override
+    public String getLodBackchannelHost() {
+        return Input.checkAdvertisedHost(configModel.lodBackchannelHost);
+    }
+
+    // Every setter below clamps to the same range its getter enforces, then saves. Clamping only on
+    // read would let the file hold a number the mod refuses to honour, so the file and `/cs set` would
+    // disagree about what is in force, and the file is what an operator inspects when something is wrong.
+
+    @Override
+    public void setLanguage(String language) {
+        configModel.language = Input.checkLanguage(language);
+        saveConfig();
+        Translator.setLanguage(getLanguage());
+    }
+
+    @Override
+    public void setContinueOnRestart(boolean continueOnRestart) {
+        configModel.continueOnRestart = continueOnRestart;
+        saveConfig();
+    }
+
+    @Override
+    public void setForceLoadExistingChunks(boolean forceLoadExistingChunks) {
+        configModel.forceLoadExistingChunks = forceLoadExistingChunks;
+        saveConfig();
+    }
+
+    @Override
+    public void setIoThrottleEnabled(boolean enabled) {
+        configModel.ioThrottle = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleTargetMspt(double mspt) {
+        configModel.throttleTargetMspt = Math.max(TARGET_MSPT_MIN, Math.min(TARGET_MSPT_MAX, mspt));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxChunkMillis(long millis) {
+        configModel.throttleMaxChunkMillis =
+                Math.max(MAX_CHUNK_MILLIS_MIN, Math.min(MAX_CHUNK_MILLIS_MAX, millis));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxQueuedWrites(long writes) {
+        // 0 is not out of range: it is the documented "disable the backlog bound" value, so it must
+        // survive the clamp rather than being pulled up to the minimum.
+        configModel.throttleMaxQueuedWrites = writes <= 0L
+                ? 0L
+                : Math.max(MAX_QUEUED_WRITES_MIN, Math.min(MAX_QUEUED_WRITES_MAX, writes));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxAddedChunks(long chunks) {
+        // 0 is the documented "disable the residency bound" value, as with the write backlog above.
+        configModel.throttleMaxAddedChunks = chunks <= 0L
+                ? 0L
+                : Math.max(MAX_ADDED_CHUNKS_MIN, Math.min(MAX_ADDED_CHUNKS_MAX, chunks));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxHeapPercent(long percent) {
+        // 0 disables, as with the other bounds.
+        configModel.throttleMaxHeapPercent = percent <= 0L
+                ? 0L
+                : Math.max(MAX_HEAP_PERCENT_MIN, Math.min(MAX_HEAP_PERCENT_MAX, percent));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleTickBudgetMillis(long millis) {
+        configModel.throttleTickBudgetMillis = millis <= 0L
+                ? 0L
+                : Math.max(TICK_BUDGET_MIN, Math.min(TICK_BUDGET_MAX, millis));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottlePlayerReserveMillis(long millis) {
+        configModel.throttlePlayerReserveMillis =
+                Math.max(PLAYER_RESERVE_MIN, Math.min(PLAYER_RESERVE_MAX, millis));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleCeilingMillis(long millis) {
+        configModel.throttleCeilingMillis = millis <= 0L
+                ? 0L
+                : Math.max(CEILING_MIN, Math.min(CEILING_MAX, millis));
+        saveConfig();
+    }
+
+    @Override
+    public void setAutoPauseEnabled(boolean enabled) {
+        configModel.autoPauseOnOverload = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public void setAutoPauseGraceSeconds(int seconds) {
+        configModel.autoPauseGraceSeconds =
+                Math.max(AUTO_PAUSE_GRACE_MIN, Math.min(AUTO_PAUSE_GRACE_MAX, seconds));
+        saveConfig();
+    }
+
+    @Override
+    public void setPregenSettleMaxHeld(long maxHeld) {
+        // 0 disables the cap entirely, so it must survive the clamp.
+        configModel.pregenSettleMaxHeld = maxHeld <= 0L
+                ? 0L
+                : Math.max(SETTLE_MAX_HELD_MIN, Math.min(SETTLE_MAX_HELD_MAX, maxHeld));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleMaxLodQueue(long items) {
+        // 0 disables, as above.
+        configModel.throttleMaxLodQueue = items <= 0L
+                ? 0L
+                : Math.max(MAX_LOD_QUEUE_MIN, Math.min(MAX_LOD_QUEUE_MAX, items));
+        saveConfig();
+    }
+
+    @Override
+    public void setThrottleLodDrainTo(long items) {
+        // 0 disables, as above.
+        configModel.throttleLodDrainTo = Math.max(0L, items);
+        saveConfig();
+    }
+
+    @Override
+    public void setDispatchMaxConcurrent(long chunks) {
+        configModel.dispatchMaxConcurrent = Math.max(DISPATCH_MAX_CONCURRENT_MIN,
+                Math.min(DISPATCH_MAX_CONCURRENT_MAX, chunks));
+        saveConfig();
+    }
+
+    @Override
+    public void setLodMode(LodMode mode) {
+        configModel.lodEnabled = mode.name().toLowerCase(Locale.ROOT);
+        saveConfig();
+    }
+
+    @Override
+    public void setLodDhOverrideEnabled(boolean enabled) {
+        configModel.lodDhOverride = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public void setLodFromExploredChunksEnabled(boolean enabled) {
+        configModel.lodFromExploredChunks = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public boolean isLodBackgroundSendEnabled() {
+        // A config written before 4.7.0 has no key, and reads the default: on.
+        return Optional.ofNullable(configModel.lodBackgroundSend).orElse(true);
+    }
+
+    @Override
+    public void setLodBackgroundSendEnabled(boolean enabled) {
+        configModel.lodBackgroundSend = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public void setLodBackchannelPort(int port) {
+        // An out-of-range port falls back to deriving one, rather than clamping to the nearest legal
+        // port. Clamping would answer "set it to 80" with "it is now 1024", which is a different server
+        // than the one that was asked for; deriving is at least the documented default and is what the
+        // getter already reports for the same input.
+        configModel.lodBackchannelPort =
+                (port < BACKCHANNEL_PORT_MIN || port > BACKCHANNEL_PORT_MAX)
+                        ? BACKCHANNEL_PORT_DERIVE
+                        : port;
+        saveConfig();
+    }
+
+    @Override
+    public void setLodIndexBudgetMb(long megabytes) {
+        // Same rule the getter applies, so the file and `/cs set` never disagree about what is in
+        // force: anything outside the range is stored as "no budget" rather than clamped to an edge
+        // the operator did not ask for.
+        configModel.lodIndexBudgetMb =
+                (megabytes <= LOD_INDEX_BUDGET_MB_NONE || megabytes > LOD_INDEX_BUDGET_MB_MAX)
+                        ? LOD_INDEX_BUDGET_MB_NONE
+                        : megabytes;
+        saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterPregenEnabled(boolean enabled) {
+        configModel.worldEnterPregen = enabled;
+        saveConfig();
+    }
+
+    @Override
+    public LodMode getWorldEnterLodMode() {
+        String raw = configModel.worldEnterLod;
+        LodMode mode = LodMode.parse(raw);
+        if (mode == null) {
+            LOGGER.warn("Chunksmith: worldEnterLod '" + raw + "' is not one of auto/on/off, using auto");
+            return LodMode.AUTO;
+        }
+        return mode;
+    }
+
+    @Override
+    public void setWorldEnterLodMode(LodMode mode) {
+        configModel.worldEnterLod = mode.name().toLowerCase(Locale.ROOT);
+        saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterLodHorizon(long blocks) {
+        configModel.worldEnterLodHorizon = Math.max(0L, Math.min(WORLD_ENTER_RADIUS_MAX, blocks));
+        saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterPregenShape(String shape) {
+        String parsed = WorldEnterShape.parse(shape);
+        configModel.worldEnterPregenShape = parsed == null ? WorldEnterShape.DEFAULT : parsed;
+        saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterPregenDimensions(String spec) {
+        var parsed = WorldEnterDimensions.parse(spec);
+        configModel.worldEnterPregenDimensions =
+                parsed == null ? WorldEnterDimensions.DEFAULT : WorldEnterDimensions.spec(parsed);
+        saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterPregenRadius(long blocks) {
+        configModel.worldEnterPregenRadius =
+                Math.max(WORLD_ENTER_RADIUS_MIN, Math.min(WORLD_ENTER_RADIUS_MAX, blocks));
+        saveConfig();
+    }
+
+    @Override
+    public void setWorldEnterPregenCenter(String spec) {
+        // Canonicalised on the way in, so the file holds 'origin' / 'spawn' / '512,-64' and never
+        // the raw casing or spacing somebody typed. Refused values never reach here -- ConfigSettings
+        // rejects them at the command, and the getter guards the file.
+        WorldEnterCenter parsed = WorldEnterCenter.parse(spec);
+        configModel.worldEnterPregenCenter =
+                parsed == null ? WorldEnterCenter.DEFAULT : parsed.spec();
+        saveConfig();
+    }
+
+    @Override
+    public void setLodBackchannelBindAddress(String address) {
+        // Validated on the way in AND on the way out, like every other key here: the file is what an
+        // operator inspects when something is wrong, and it must not hold a value the mod refuses.
+        configModel.lodBackchannelBindAddress = Input.checkHost(address);
+        saveConfig();
+    }
+
+    @Override
+    public void setLodBackchannelHost(String host) {
+        configModel.lodBackchannelHost = Input.checkAdvertisedHost(host);
+        saveConfig();
+    }
+
+    @Override
+    public void reload() {
+        try (final Reader reader = Files.newBufferedReader(savePath)) {
+            configModel = GSON.fromJson(reader, ConfigModel.class);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void saveConfig() {
+        try {
+            Files.createDirectories(savePath.getParent());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        try (final Writer writer = Files.newBufferedWriter(savePath)) {
+            GSON.toJson(configModel, writer);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @SuppressWarnings("unused")
+    private static class ConfigModel {
+        private Integer version = 2;
+        private String language = "en";
+        private Boolean continueOnRestart = false;
+        private Boolean forceLoadExistingChunks = false;
+        private Boolean silent = false;
+        private Integer updateInterval = 1;
+        private Boolean ioThrottle = true;
+        private Double throttleTargetMspt = TARGET_MSPT_DEFAULT;
+        private Long throttleMaxChunkMillis = MAX_CHUNK_MILLIS_DEFAULT;
+        private Long throttleMaxQueuedWrites = MAX_QUEUED_WRITES_DEFAULT;
+        private Long throttleMaxAddedChunks = MAX_ADDED_CHUNKS_DEFAULT;
+        private Long throttleMaxHeapPercent = MAX_HEAP_PERCENT_DEFAULT;
+        private Long throttleTickBudgetMillis = TICK_BUDGET_DEFAULT;
+        private Long throttlePlayerReserveMillis = PLAYER_RESERVE_DEFAULT;
+        private Long throttleCeilingMillis = CEILING_DEFAULT;
+        private Boolean autoPauseOnOverload = true;
+        private Integer autoPauseGraceSeconds = AUTO_PAUSE_GRACE_DEFAULT;
+        // A tristate, written as the string "auto" by default. Declared String, not Boolean, on purpose:
+        // Gson's String adapter coerces a JSON boolean to "true"/"false", so a config that already says
+        // `"lodEnabled": false` (or true) from an older Chunksmith still parses, still means exactly what
+        // it said, and is never rewritten behind the operator's back.
+        private String lodEnabled = "auto";
+        private Long throttleMaxLodQueue = MAX_LOD_QUEUE_DEFAULT;
+        private Long throttleLodDrainTo = LOD_DRAIN_TO_DEFAULT;
+        // Resolved when the model is constructed -- i.e. at config load, after the entrypoint
+        // has published ServerEnvironment -- so a fresh config file is written with the right
+        // number for this machine rather than a constant fixed at class-init time.
+        private Long dispatchMaxConcurrent = dispatchMaxConcurrentDefault();
+        private Boolean lodDhOverride = false;
+        // On by default. See Config#isLodFromExploredChunksEnabled.
+        private Boolean lodFromExploredChunks = true;
+        // On by default. See Config#isLodBackgroundSendEnabled.
+        private Boolean lodBackgroundSend = true;
+        // 0 = derive from the game port. See Config#getLodBackchannelPort.
+        private Integer lodBackchannelPort = BACKCHANNEL_PORT_DERIVE;
+        // 2048 MB by default; 0 = no ceiling. See Config#getLodIndexBudgetMb.
+        private Long lodIndexBudgetMb = LOD_INDEX_BUDGET_MB_DEFAULT;
+        // On by default; single-player only. See Config#isWorldEnterPregenEnabled.
+        private Boolean worldEnterPregen = true;
+        // auto / on / off. See Config#getWorldEnterLodMode. Replaces 4.3.6's debugWorldEnterSkipLod,
+        // which is simply dropped from the file on the next save: auto is what it should read as.
+        private String worldEnterLod = "auto";
+        private Long worldEnterPregenRadius = WORLD_ENTER_RADIUS_DEFAULT;
+        // 0 = off. See Config#getWorldEnterLodHorizon and mod_support #39.
+        private Long worldEnterLodHorizon = 0L;
+        // 'auto' from 4.5.0 (mod_support #45): spawn for a world that never finished a world-enter run,
+        // that run's own centre for one that did. See WorldEnterCenter.
+        private String worldEnterPregenCenter = WorldEnterCenter.DEFAULT;
+        // circle by default. See Config#getWorldEnterPregenShape.
+        private String worldEnterPregenShape = WorldEnterShape.DEFAULT;
+        // overworld by default. See Config#getWorldEnterPregenDimensions.
+        private String worldEnterPregenDimensions = WorldEnterDimensions.DEFAULT;
+        // Empty = bind wherever the game bound. See Config#getLodBackchannelBindAddress.
+        private String lodBackchannelBindAddress = "";
+        // Empty = let each client use the address it connected to. See Config#getLodBackchannelHost.
+        private String lodBackchannelHost = "";
+        // On by default: dropping a chunk the instant it is generated silently breaks every mod that
+        // builds on newly generated land (mod_support #14). Off is for a pure terrain pregen.
+        private Boolean pregenSettle = true;
+        private Long pregenSettleDelayTicks = SETTLE_DELAY_DEFAULT;
+        private Integer pregenSettleRadius = SETTLE_RADIUS_DEFAULT;
+        private Long pregenSettleMaxHeld = SETTLE_MAX_HELD_DEFAULT;
+        private Map<String, TaskModel> tasks;
+
+        public Integer getVersion() { return version; }
+        public void setVersion(Integer version) { this.version = version; }
+        public String getLanguage() { return language; }
+        public void setLanguage(String language) { this.language = language; }
+        public Boolean getContinueOnRestart() { return continueOnRestart; }
+        public void setContinueOnRestart(Boolean continueOnRestart) { this.continueOnRestart = continueOnRestart; }
+        public Boolean getForceLoadExistingChunks() { return forceLoadExistingChunks; }
+        public void setForceLoadExistingChunks(Boolean forceLoadExistingChunks) { this.forceLoadExistingChunks = forceLoadExistingChunks; }
+        public Map<String, TaskModel> getTasks() { return tasks; }
+        public void setTasks(Map<String, TaskModel> tasks) { this.tasks = tasks; }
+        public boolean isSilent() { return silent; }
+        public void setSilent(boolean silent) { this.silent = silent; }
+        public int getUpdateInterval() { return updateInterval; }
+        public void setUpdateInterval(int updateInterval) { this.updateInterval = updateInterval; }
+        public Boolean getIoThrottle() { return ioThrottle; }
+        public void setIoThrottle(Boolean ioThrottle) { this.ioThrottle = ioThrottle; }
+        public Double getThrottleTargetMspt() { return throttleTargetMspt; }
+        public void setThrottleTargetMspt(Double throttleTargetMspt) { this.throttleTargetMspt = throttleTargetMspt; }
+        public Long getThrottleMaxChunkMillis() { return throttleMaxChunkMillis; }
+        public void setThrottleMaxChunkMillis(Long throttleMaxChunkMillis) { this.throttleMaxChunkMillis = throttleMaxChunkMillis; }
+        public Long getThrottleMaxQueuedWrites() { return throttleMaxQueuedWrites; }
+        public void setThrottleMaxQueuedWrites(Long throttleMaxQueuedWrites) { this.throttleMaxQueuedWrites = throttleMaxQueuedWrites; }
+        public Long getThrottleMaxAddedChunks() { return throttleMaxAddedChunks; }
+        public void setThrottleMaxAddedChunks(Long throttleMaxAddedChunks) { this.throttleMaxAddedChunks = throttleMaxAddedChunks; }
+        public Long getThrottleCeilingMillis() { return throttleCeilingMillis; }
+        public void setThrottleCeilingMillis(Long throttleCeilingMillis) { this.throttleCeilingMillis = throttleCeilingMillis; }
+        public Long getThrottlePlayerReserveMillis() { return throttlePlayerReserveMillis; }
+        public void setThrottlePlayerReserveMillis(Long throttlePlayerReserveMillis) { this.throttlePlayerReserveMillis = throttlePlayerReserveMillis; }
+        public Long getThrottleTickBudgetMillis() { return throttleTickBudgetMillis; }
+        public void setThrottleTickBudgetMillis(Long throttleTickBudgetMillis) { this.throttleTickBudgetMillis = throttleTickBudgetMillis; }
+        public Long getThrottleMaxHeapPercent() { return throttleMaxHeapPercent; }
+        public void setThrottleMaxHeapPercent(Long throttleMaxHeapPercent) { this.throttleMaxHeapPercent = throttleMaxHeapPercent; }
+        public Boolean getAutoPauseOnOverload() { return autoPauseOnOverload; }
+        public void setAutoPauseOnOverload(Boolean autoPauseOnOverload) { this.autoPauseOnOverload = autoPauseOnOverload; }
+        public Integer getAutoPauseGraceSeconds() { return autoPauseGraceSeconds; }
+        public void setAutoPauseGraceSeconds(Integer autoPauseGraceSeconds) { this.autoPauseGraceSeconds = autoPauseGraceSeconds; }
+        public Long getPregenSettleMaxHeld() { return pregenSettleMaxHeld; }
+        public void setPregenSettleMaxHeld(Long pregenSettleMaxHeld) { this.pregenSettleMaxHeld = pregenSettleMaxHeld; }
+    }
+
+    @SuppressWarnings("unused")
+    private static class TaskModel {
+        private Boolean cancelled;
+        private Double radius;
+        private Double radiusZ;
+        private Double centerX;
+        private Double centerZ;
+        private String iterator;
+        private String shape;
+        private Long count;
+        private Long time;
+
+        public Boolean getCancelled() { return cancelled; }
+        public void setCancelled(Boolean cancelled) { this.cancelled = cancelled; }
+        public Double getRadius() { return radius; }
+        public void setRadius(Double radius) { this.radius = radius; }
+        public Double getRadiusZ() { return radiusZ; }
+        public void setRadiusZ(Double radiusZ) { this.radiusZ = radiusZ; }
+        public Double getCenterX() { return centerX; }
+        public void setCenterX(Double centerX) { this.centerX = centerX; }
+        public Double getCenterZ() { return centerZ; }
+        public void setCenterZ(Double centerZ) { this.centerZ = centerZ; }
+        public String getIterator() { return iterator; }
+        public void setIterator(String iterator) { this.iterator = iterator; }
+        public String getShape() { return shape; }
+        public void setShape(String shape) { this.shape = shape; }
+        public Long getCount() { return count; }
+        public void setCount(Long count) { this.count = count; }
+        public Long getTime() { return time; }
+        public void setTime(Long time) { this.time = time; }
+    }
+}

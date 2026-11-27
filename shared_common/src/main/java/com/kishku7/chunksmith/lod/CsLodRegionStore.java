@@ -1,0 +1,244 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod;
+
+import com.kishku7.chunksmith.lod.net.CsLodProtocol;
+
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.List;
+import java.util.stream.Stream;
+
+/**
+ * On-disk store for CSLOD chunk records.
+ *
+ * <p>Anvil-shaped, deliberately: one region file per 32x32 chunks, a fixed header of (offset, length) slots,
+ * then the compressed records. Writes append the payload and then rewrite the header slot, so a torn write
+ * loses at most the one chunk being written and never the file. Rewriting a chunk appends a new record and
+ * re-points the slot, leaving the old bytes behind as garbage; pregen writes each chunk once, so in the
+ * normal case there is nothing to reclaim.
+ *
+ * <pre>
+ *   &lt;world&gt;/chunksmith/lod/&lt;dim&gt;/r.&lt;rx&gt;.&lt;rz&gt;.cslod
+ *
+ *   header: 1024 slots x 8 bytes = 8192 bytes
+ *           slot = i64 offset (0 = absent) ... stored as i32 offset + i32 length
+ *   body:   Deflate-compressed CsLodCodec records, appended
+ * </pre>
+ *
+ * <p><b>No native dependencies, no locks, no daemon.</b> voxy's RocksDB is process-exclusive and DH's SQLite
+ * is DH's; our store has to be readable by a second process (a backfill tool) without fighting either.
+ *
+ * <p>A record {@code length} read from a header slot is validated against
+ * {@link CsLodProtocol#MAX_RECORD_BYTES} before {@code new byte[length]}: on the in-band path a region
+ * file's bytes are streamed from a server we do not trust, so a bogus slot length must not OOM the reader.
+ */
+public final class CsLodRegionStore {
+
+    /** Chunks per region axis. */
+    public static final int REGION_CHUNKS = 32;
+
+    private static final int SLOTS = REGION_CHUNKS * REGION_CHUNKS;
+    private static final int SLOT_BYTES = 8;
+    private static final int HEADER_BYTES = SLOTS * SLOT_BYTES;
+
+    private final Path root;
+    private final Map<Long, RandomAccessFile> open = new HashMap<>();
+
+    /** @param root the per-dimension directory, e.g. {@code <world>/chunksmith/lod/minecraft_overworld} */
+    public CsLodRegionStore(Path root) {
+        this.root = root;
+    }
+
+    /**
+     * Writes one chunk record.
+     *
+     * @return the number of compressed bytes written, so callers can account size without re-encoding
+     */
+    public synchronized int write(CsLodChunk chunk) throws IOException {
+        byte[] payload = CsLodCodec.encode(chunk);
+        int rx = Math.floorDiv(chunk.getChunkX(), REGION_CHUNKS);
+        int rz = Math.floorDiv(chunk.getChunkZ(), REGION_CHUNKS);
+        RandomAccessFile file = region(rx, rz);
+
+        int slot = slotIndex(chunk.getChunkX(), chunk.getChunkZ());
+        long offset = file.length();
+
+        // Append the payload FIRST, then point the header slot at it. A crash between the two leaves
+        // orphaned bytes (harmless) rather than a slot pointing at a half-written record.
+        file.seek(offset);
+        file.write(payload);
+
+        file.seek((long) slot * SLOT_BYTES);
+        file.writeInt((int) offset);
+        file.writeInt(payload.length);
+        return payload.length;
+    }
+
+    /** Reads one chunk record back, or null if this chunk was never written. */
+    public synchronized CsLodChunk read(int chunkX, int chunkZ) throws IOException {
+        int rx = Math.floorDiv(chunkX, REGION_CHUNKS);
+        int rz = Math.floorDiv(chunkZ, REGION_CHUNKS);
+        Path path = regionPath(rx, rz);
+        if (!Files.exists(path)) {
+            return null;
+        }
+        RandomAccessFile file = region(rx, rz);
+        int slot = slotIndex(chunkX, chunkZ);
+        file.seek((long) slot * SLOT_BYTES);
+        int offset = file.readInt();
+        int length = file.readInt();
+        if (offset <= 0 || length <= 0) {
+            return null;
+        }
+        // Bound before allocating: length comes from a header slot whose bytes may have been streamed
+        // in-band from an untrusted server (see MAX_RECORD_BYTES).
+        if (length > CsLodProtocol.MAX_RECORD_BYTES) {
+            throw new IOException("CSLOD region " + path.getFileName() + " slot " + slot
+                    + ": record length " + length + " exceeds " + CsLodProtocol.MAX_RECORD_BYTES);
+        }
+        byte[] payload = new byte[length];
+        file.seek(offset);
+        file.readFully(payload);
+        return CsLodCodec.decode(payload);
+    }
+
+    /**
+     * Walks every record in a CSLOD tree and hands each decoded chunk to the visitor. Static and stateless on
+     * purpose, because this is how a second process (a backfill/verify tool) reads the store while the game holds
+     * nothing.
+     *
+     * @return the number of records visited
+     */
+    public static int forEachChunk(Path root, ChunkVisitor visitor) throws IOException {
+        if (!Files.isDirectory(root)) {
+            return 0;
+        }
+        int visited = 0;
+        try (Stream<Path> walk = Files.walk(root)) {
+            List<Path> regions = walk
+                    .filter(path -> path.getFileName().toString().endsWith(".cslod"))
+                    .sorted()
+                    .toList();
+            for (Path region : regions) {
+                visited += forEachChunkIn(region, visitor);
+            }
+        }
+        return visited;
+    }
+
+    /**
+     * Walks ONE region's records. A client that keeps pulling as the player travels must inject only the
+     * regions it just received: re-walking the whole tree on every refresh re-decodes and re-pushes terrain
+     * the renderer already has, which is minutes per move on a big store, and with voxy means re-ingesting
+     * hundreds of thousands of sections.
+     *
+     * @return the number of records visited (0 if the region file does not exist)
+     */
+    public static int forEachChunkInRegion(final Path root, final int regionX, final int regionZ,
+                                           final ChunkVisitor visitor) throws IOException {
+        Path region = root.resolve("r." + regionX + "." + regionZ + ".cslod");
+        if (!Files.isRegularFile(region)) {
+            return 0;
+        }
+        return forEachChunkIn(region, visitor);
+    }
+
+    private static int forEachChunkIn(Path region, ChunkVisitor visitor) throws IOException {
+        int visited = 0;
+        try (RandomAccessFile file = new RandomAccessFile(region.toFile(), "r")) {
+            for (int slot = 0; slot < SLOTS; slot++) {
+                file.seek((long) slot * SLOT_BYTES);
+                int offset = file.readInt();
+                int length = file.readInt();
+                if (offset <= 0 || length <= 0) {
+                    continue;
+                }
+                // Bound before allocating: see read() above and MAX_RECORD_BYTES.
+                if (length > CsLodProtocol.MAX_RECORD_BYTES) {
+                    throw new IOException("CSLOD region " + region.getFileName() + " slot " + slot
+                            + ": record length " + length + " exceeds " + CsLodProtocol.MAX_RECORD_BYTES);
+                }
+                byte[] payload = new byte[length];
+                file.seek(offset);
+                file.readFully(payload);
+                visitor.visit(CsLodCodec.decode(payload));
+                visited++;
+            }
+        }
+        return visited;
+    }
+
+    /** Visitor for {@link #forEachChunk}. May throw to abort the walk. */
+    @FunctionalInterface
+    public interface ChunkVisitor {
+        void visit(CsLodChunk chunk) throws IOException;
+    }
+
+    /** Closes every open region file. */
+    public synchronized void close() throws IOException {
+        IOException first = null;
+        for (RandomAccessFile file : open.values()) {
+            try {
+                file.close();
+            } catch (IOException e) {
+                if (first == null) {
+                    first = e;
+                }
+            }
+        }
+        open.clear();
+        if (first != null) {
+            throw first;
+        }
+    }
+
+    private RandomAccessFile region(int rx, int rz) throws IOException {
+        long key = ((long) rx << 32) ^ (rz & 0xFFFFFFFFL);
+        RandomAccessFile file = open.get(key);
+        if (file != null) {
+            return file;
+        }
+        Path path = regionPath(rx, rz);
+        Files.createDirectories(path.getParent());
+        file = new RandomAccessFile(path.toFile(), "rw");
+        if (file.length() < HEADER_BYTES) {
+            file.setLength(HEADER_BYTES);
+        }
+        open.put(key, file);
+        return file;
+    }
+
+    private Path regionPath(int rx, int rz) {
+        return root.resolve("r." + rx + "." + rz + ".cslod");
+    }
+
+    private static int slotIndex(int chunkX, int chunkZ) {
+        int localX = Math.floorMod(chunkX, REGION_CHUNKS);
+        int localZ = Math.floorMod(chunkZ, REGION_CHUNKS);
+        return localZ * REGION_CHUNKS + localX;
+    }
+}

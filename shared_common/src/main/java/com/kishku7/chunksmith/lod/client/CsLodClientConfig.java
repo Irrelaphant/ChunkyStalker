@@ -1,0 +1,358 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.client;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Properties;
+
+/**
+ * The LOD client's own settings: how often to ask the server whether anything changed,
+ * and whether to re-inject everything on the next join.
+ *
+ * <p>No settings screen, deliberately; a config UI is 3.2's problem. This is a plain
+ * {@code config/chunksmith-lod.properties} the client writes with its defaults and
+ * comments on first run, discoverable by anyone who opens the folder and editable without
+ * a mod menu.
+ *
+ * <p><b>Both settings are also reachable from {@code /cslod set}</b> (3.3.0): a setting
+ * you can only change by editing a file and restarting is not a setting on a running
+ * game. The command writes through {@link #setSyncSeconds(int)} / {@link
+ * #setReinjectOnJoin(boolean)}, which apply the value to the running client and save the
+ * file, so the two can never disagree. {@link CsLodClientSettings} is the registry that
+ * exposes them, and a coverage test fails by name if a key here is not in it.
+ *
+ * <p><b>The floor is enforced in code, not in the file.</b> The value is clamped to
+ * {@link #MIN_SYNC_SECONDS} every time it is read AND on the way in when set by command,
+ * so nothing downstream can see a smaller number whatever the file says.
+ */
+public final class CsLodClientConfig {
+
+    /** The file, under the game's {@code config/} directory. */
+    public static final String FILE_NAME = "chunksmith-lod.properties";
+
+    /** How often to ask the server whether anything changed. */
+    public static final String KEY_SYNC_SECONDS = "sync-interval-seconds";
+
+    /**
+     * Throw away what we remember having injected, and inject it all again.
+     *
+     * <p>The escape hatch for the one case the injected index cannot detect: the player
+     * emptying the renderer's own database underneath it. voxy's storage and DH's sqlite
+     * are theirs, and nothing we can read says "this was reset", so our record would
+     * honestly describe data that is gone and we would skip it forever. Set it true, join
+     * once, set it back; that is what the command below does without
+     * leaving the game with {@code /csclient set reinject-on-join true}, and deleting the
+     * {@code .injected} files does the same.
+     */
+    public static final String KEY_REINJECT = "reinject-on-join";
+
+    /**
+     * A ceiling, in megabytes, on what this client will write per dimension per server.
+     *
+     * <p>Zero means no ceiling, which is what every client did before 4.0.0 and remains the default.
+     * How much a client writes has always been the SERVER's decision -- it advertises an index and the
+     * client fetches all of it -- and an operator may raise {@code lodIndexBudgetMb} to a terabyte or
+     * switch it off entirely. This is the first control on THIS side (mod_support #30).
+     *
+     * <p>Deliberately NOT defaulted to a number. A default ceiling would silently stop existing
+     * players receiving terrain they already have, and the same reasoning settled the server budget in
+     * #23: an upgrade must not change what an untouched install does. What was missing was a say, not
+     * a smaller number. {@code /csclient status} reports the size so the decision can be an informed
+     * one.
+     *
+     * <p>Regions are kept nearest-first, so a ceiling trims the far horizon rather than punching holes
+     * in what is close.
+     */
+    public static final String KEY_MAX_DISK_MB = "max-disk-mb";
+
+    /**
+     * How far from the player, in BLOCKS, the far map is filled from the server's LOD store when Xaero's World
+     * Map is installed (Chunksmith 5.0). Voxy and Distant Horizons say how far they draw; Xaero has no such
+     * setting, so this is the equivalent. A store region is about 5 MB for 512x512 blocks, so a radius of 2048
+     * is up to 64 regions, roughly 300 MB, and the disk ceiling above still applies.
+     */
+    public static final String KEY_MAP_RADIUS = "map-radius-blocks";
+
+    /** The default for {@link #KEY_MAP_RADIUS}. */
+    public static final int DEFAULT_MAP_RADIUS_BLOCKS = 2048;
+
+    /**
+     * How often the client asks "has anything changed?" by default. Five minutes.
+     *
+     * <p>The poll costs 22 bytes out and 34 bytes back and opens no file on either side,
+     * so the interval is not chosen to protect the server: it is chosen so a player
+     * standing in a base sees their horizon extend every few minutes while an operator's
+     * pregen fills the world in behind them.
+     */
+    public static final int DEFAULT_SYNC_SECONDS = 300;
+
+    /**
+     * Thirty seconds -- the sync floor.
+     *
+     * <p>One poll is one readdir plus one stat per in-range region, on a background
+     * thread: for a 340-region store with a 4-region radius, ~86 syscalls and zero bytes
+     * of file content. At 30 s a hundred clients cost the server about three of those per
+     * second. Below that the sync starts becoming the problem it solves.
+     */
+    public static final int MIN_SYNC_SECONDS = 30;
+
+    private static final String COMMENT =
+            " Chunksmith LOD client.\n"
+            + "\n"
+            + " Both settings can also be changed in-game with /cslod set <name> <value>, which applies\n"
+            + " the value immediately and rewrites this file. Editing by hand still works; the file is\n"
+            + " read at startup.\n"
+            + "\n"
+            + " " + KEY_SYNC_SECONDS + ": how often (in SECONDS) to ask the server whether its LOD store\n"
+            + " has changed. The check itself is two tiny messages; a full index is only pulled when the\n"
+            + " answer is 'yes'. This is what lets a player who is STANDING STILL pick up terrain from a\n"
+            + " pregen that is still running, with no relog and no need to go for a walk.\n"
+            + "\n"
+            + " Default " + DEFAULT_SYNC_SECONDS + ". Values below " + MIN_SYNC_SECONDS
+            + " are clamped to " + MIN_SYNC_SECONDS + ".\n"
+            + "\n"
+            + " " + KEY_REINJECT + ": normally Chunksmith remembers which LOD regions it has already\n"
+            + " given to your renderer, so joining a world does not re-send terrain voxy or Distant\n"
+            + " Horizons already has. Set this to true for ONE join if you have deleted or reset your\n"
+            + " renderer's own data and want everything sent again. Default false.\n"
+            + "\n"
+            + " " + KEY_MAX_DISK_MB + ": a ceiling, in MEGABYTES, on what Chunksmith will store per\n"
+            + " dimension per server. 0 (the default) means no ceiling, which is how every version\n"
+            + " before 4.0.0 behaved. How much arrives is otherwise entirely the server's choice.\n"
+            + " Regions nearest you are kept first, so a ceiling shortens your far horizon rather\n"
+            + " than leaving gaps nearby.";
+
+    private static volatile int syncSeconds = DEFAULT_SYNC_SECONDS;
+    private static volatile boolean reinject;
+    private static volatile long maxDiskMb;
+    private static volatile int mapRadiusBlocks = DEFAULT_MAP_RADIUS_BLOCKS;
+    private static volatile boolean loaded;
+
+    /**
+     * Where the file lives, remembered from {@link #load} so a later {@code /cslod set}
+     * can save without being handed the config directory again. Null until load() has
+     * run. On a dedicated server this class is never touched. A save with no path applies
+     * the value in memory and writes nothing.
+     */
+    private static volatile Path file;
+
+    private CsLodClientConfig() {
+    }
+
+    /**
+     * Reads the config, writing it with defaults if it is not there yet. Every failure
+     * mode ends at the default (an unreadable file, a missing key, a value that is not a
+     * number) because a config problem must never be the reason a player gets no terrain.
+     *
+     * @return the message to log; one line, said once, and it names the clamp when the clamp bit
+     */
+    public static synchronized String load(Path configDir) {
+        Path path = configDir.resolve(FILE_NAME);
+        file = path;
+        Properties properties = new Properties();
+        boolean present = false;
+        if (Files.isRegularFile(path)) {
+            try (InputStream in = Files.newInputStream(path)) {
+                properties.load(in);
+                present = true;
+            } catch (IOException e) {
+                loaded = true;
+                syncSeconds = DEFAULT_SYNC_SECONDS;
+                reinject = false;
+                maxDiskMb = 0L;
+                mapRadiusBlocks = DEFAULT_MAP_RADIUS_BLOCKS;
+                return "could not read " + FILE_NAME + " (" + e + "); using the defaults";
+            }
+        }
+
+        // Anything not literally "true" is false: a misspelt value must not silently turn a one-shot
+        // recovery switch into permanent behaviour.
+        reinject = Boolean.parseBoolean(
+                properties.getProperty(KEY_REINJECT, "false").trim());
+
+        int mapRadius = DEFAULT_MAP_RADIUS_BLOCKS;
+        String rawMap = properties.getProperty(KEY_MAP_RADIUS);
+        if (rawMap != null && !rawMap.isBlank()) {
+            try {
+                mapRadius = Math.max(256, Math.min(32768, Integer.parseInt(rawMap.trim())));
+            } catch (NumberFormatException ignored) {
+                mapRadius = DEFAULT_MAP_RADIUS_BLOCKS;
+            }
+        }
+        mapRadiusBlocks = mapRadius;
+
+        // Unparseable or negative is "no ceiling", matching the default rather than refusing to start.
+        long disk = 0L;
+        String rawDisk = properties.getProperty(KEY_MAX_DISK_MB);
+        if (rawDisk != null && !rawDisk.isBlank()) {
+            try {
+                disk = Math.max(0L, Long.parseLong(rawDisk.trim()));
+            } catch (NumberFormatException ignored) {
+                disk = 0L;
+            }
+        }
+        maxDiskMb = disk;
+
+        String raw = properties.getProperty(KEY_SYNC_SECONDS);
+        int requested = DEFAULT_SYNC_SECONDS;
+        boolean unparseable = false;
+        if (raw != null && !raw.isBlank()) {
+            try {
+                requested = Integer.parseInt(raw.trim());
+            } catch (NumberFormatException e) {
+                unparseable = true;
+            }
+        }
+
+        int clamped = clamp(requested);
+        syncSeconds = clamped;
+        loaded = true;
+
+        if (!present) {
+            save();
+            return "wrote " + FILE_NAME + " with the defaults (sync every " + clamped + "s)";
+        }
+        if (unparseable) {
+            return FILE_NAME + ": '" + raw + "' is not a number; syncing every "
+                    + DEFAULT_SYNC_SECONDS + "s";
+        }
+        if (clamped != requested) {
+            return FILE_NAME + ": " + KEY_SYNC_SECONDS + "=" + requested + " is below the "
+                    + MIN_SYNC_SECONDS + "s minimum; syncing every " + clamped + "s instead";
+        }
+        if (reinject) {
+            return "syncing with the server every " + clamped + "s; " + KEY_REINJECT
+                    + " is ON, so every LOD region will be sent to your renderer again this session"
+                    + " (set it back to false once your terrain is back)";
+        }
+        return "syncing with the server every " + clamped + "s";
+    }
+
+    /** The interval, in milliseconds, already clamped. */
+    public static long syncIntervalMillis() {
+        return syncSeconds * 1000L;
+    }
+
+    public static int syncIntervalSeconds() {
+        return syncSeconds;
+    }
+
+    /** How far the Xaero far map is filled, in blocks. See {@link #KEY_MAP_RADIUS}. */
+    public static int mapRadiusBlocks() {
+        return mapRadiusBlocks;
+    }
+
+    /** Sets the far-map radius, clamped to 256..32768 blocks, and saves it. Takes effect from the next join. */
+    public static synchronized void setMapRadiusBlocks(int blocks) {
+        mapRadiusBlocks = Math.max(256, Math.min(32768, blocks));
+        save();
+    }
+
+    public static boolean reinjectOnJoin() {
+        return reinject;
+    }
+
+    /** The per-dimension, per-server ceiling in megabytes; 0 means none. */
+    public static long maxDiskMb() {
+        return maxDiskMb;
+    }
+
+    /** The same ceiling in bytes, or 0 for none. What {@code CsLodDiskBudget} takes. */
+    public static long maxDiskBytes() {
+        long megabytes = maxDiskMb;
+        return megabytes <= 0L ? 0L : megabytes * 1024L * 1024L;
+    }
+
+    /** Sets the ceiling and saves it. Negative is stored as 0, so the file cannot hold a value we refuse. */
+    public static synchronized long setMaxDiskMb(long megabytes) {
+        maxDiskMb = Math.max(0L, megabytes);
+        save();
+        return maxDiskMb;
+    }
+
+    public static boolean isLoaded() {
+        return loaded;
+    }
+
+    /**
+     * Sets the sync interval and saves it. Clamped on write as well as on read, so the
+     * file can never hold a number the client would refuse to honour.
+     *
+     * @return the value actually stored, which is what the command reports rather than echoing the input
+     */
+    public static synchronized int setSyncSeconds(int seconds) {
+        syncSeconds = clamp(seconds);
+        save();
+        return syncSeconds;
+    }
+
+    /** Sets the one-shot re-injection switch and saves it. See {@link #KEY_REINJECT}. */
+    public static synchronized void setReinjectOnJoin(boolean value) {
+        reinject = value;
+        save();
+    }
+
+    /** Returns the value with the floor applied. Public so the unit test asserts the same function. */
+    public static int clamp(int seconds) {
+        return Math.max(MIN_SYNC_SECONDS, seconds);
+    }
+
+    /** Sets the interval directly, as though it had been read from a file. Test seam. */
+    static void setForTesting(int seconds) {
+        syncSeconds = clamp(seconds);
+        loaded = true;
+    }
+
+    static void setReinjectForTesting(boolean value) {
+        reinject = value;
+    }
+
+    /**
+     * Writes the values currently in force, not the defaults. A failure is swallowed,
+     * since the value is in effect in memory, and a player who cannot write their own
+     * config directory has a bigger problem.
+     */
+    private static void save() {
+        Path path = file;
+        if (path == null) {
+            return;
+        }
+        Properties out = new Properties();
+        out.setProperty(KEY_SYNC_SECONDS, Integer.toString(syncSeconds));
+        out.setProperty(KEY_REINJECT, Boolean.toString(reinject));
+        out.setProperty(KEY_MAX_DISK_MB, Long.toString(maxDiskMb));
+        out.setProperty(KEY_MAP_RADIUS, Integer.toString(mapRadiusBlocks));
+        try {
+            Files.createDirectories(path.getParent());
+            try (OutputStream stream = Files.newOutputStream(path)) {
+                out.store(stream, COMMENT);
+            }
+        } catch (IOException ignored) {
+            // See the javadoc: the defaults are already in effect and nothing downstream depends on the
+            // file having been written.
+        }
+    }
+}

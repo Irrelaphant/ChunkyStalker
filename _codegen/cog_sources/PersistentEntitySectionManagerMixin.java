@@ -1,0 +1,283 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.mixin;
+
+import com.mojang.logging.LogUtils;
+//[[[cog
+// import cog, compat
+// for imp in compat.ioworker_executor_imports(mcver):
+//     cog.outl(imp)
+//]]]
+//[[[end]]]
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.storage.EntityStorage;
+//[[[cog
+// import cog, compat
+// # IOWorker local is declared when the reach-path holds the worker as an IOWorker before casting:
+// #  - ancient (direct EntityStorage.worker): always holds an IOWorker local.
+// #  - SRS + mailbox (transitional): holds an IOWorker local (rawWorker) before casting.
+// #  - SRS + executor (modern): casts inline, no IOWorker local.
+// if (not compat.entity_storage_uses_srs(mcver)) or compat.use_mailbox_executor(mcver):
+//     cog.outl("import net.minecraft.world.level.chunk.storage.IOWorker;")
+//]]]
+//[[[end]]]
+import net.minecraft.world.level.chunk.storage.RegionFileStorage;
+//[[[cog
+// import cog, compat
+// # SimpleRegionStorage only exists / is referenced on the SRS eras (transitional+).
+// if compat.entity_storage_uses_srs(mcver):
+//     cog.outl("import net.minecraft.world.level.chunk.storage.SimpleRegionStorage;")
+//]]]
+//[[[end]]]
+import net.minecraft.world.level.entity.ChunkEntities;
+import net.minecraft.world.level.entity.EntityPersistentStorage;
+import net.minecraft.world.level.entity.PersistentEntitySectionManager;
+import com.kishku7.chunksmith.util.Debug;
+import org.slf4j.Logger;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
+//[[[cog
+// import cog, compat
+// cog.outl(compat.pending_writes_import(mcver))
+//]]]
+//[[[end]]]
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * Fixes the long-standing worldgen entity-retention defect: mobs (and other entities)
+ * that spawn as chunks are generated during a large pre-generation are never unloaded,
+ * so server RAM climbs until a restart, and a blocking save of the backlog can stall the
+ * main thread past the 60-second tick watchdog and crash the server.
+ *
+ * <p>Root cause, in vanilla {@code PersistentEntitySectionManager}: worldgen entities
+ * enter via {@code addWorldGenChunkEntities}, leaving the chunk's entity load-status
+ * {@code FRESH}. {@code storeChunkSections} refuses to free a fresh chunk's entities
+ * until an async disk-read round-trip completes ({@code requestChunkLoad(); return
+ * false;}). That read exists only to merge any already-persisted entities before the
+ * store overwrites the region entry. During heavy pre-gen the world disk is saturated by
+ * chunk writes, so the unload reads stall and entities pile up.
+ *
+ * <p>When the chunk has no persisted entity data there is nothing to merge, and the read
+ * is pure overhead. We {@code @Redirect} the {@code loadEntities} call inside {@code
+ * requestChunkLoad} and decide whether real data exists. That decision has to be made
+ * against a consistent view, so the probe runs on the IOWorker's own single-threaded
+ * executor (the one thread that mutates {@code pendingWrites} and owns the region
+ * files). There it checks both:
+ * <ul>
+ *   <li>{@code pendingWrites}: entities already stored this session but not yet flushed to disk; a
+ *       plain on-disk read would miss these and the next store would clobber them, and</li>
+ *   <li>the entity region file's 4096-byte offset table (read directly, serialized against writes, so
+ *       it cannot tear, and gated by {@code Files.exists} so it never opens/creates a RegionFile).</li>
+ * </ul>
+ * If either says data is present (or anything is uncertain), we fall through to the
+ * untouched vanilla read+merge, so no entity is ever lost. Only a provably-empty chunk
+ * skips the read (returns an immediately-completed empty result), which is where the
+ * RAM/stall win comes from.
+ *
+ * <p>Cog drift: two independent axes cross here (drift matrix section 2c), giving three
+ * live body shapes.
+ * <ul>
+ *   <li>AXIS A -- executor primitive: legacy (1.20.1 .. 1.21.3) drains the worker's single thread via a
+ * {@code ProcessorMailbox} ({@code mailbox.tell(new StrictQueue.IntRunnable(...))} + our
+ * own future); modern (1.21.4 .. 26) uses a {@code PriorityConsecutiveExecutor} ({@code
+ * executor.scheduleWithResult(...)} returns the future directly). The {@code
+ * pendingWrites} local type ({@code Map} vs {@code SequencedMap}) follows this
+ * axis.</li>
+ *   <li>AXIS B -- worker reach: ancient (1.20.1/1.20.4) reads {@code EntityStorage.worker} directly
+ * (no SimpleRegionStorage layer); transitional+ goes EntityStorage ->
+ * SimpleRegionStorage -> worker.</li>
+ * </ul>
+ * Both submit onto the exact same single thread that owns {@code pendingWrites}, so
+ * behaviour is identical across all shapes; only the plumbing differs. Cog emits the
+ * correct shape per version (compat.use_mailbox_executor +
+ * compat.entity_storage_uses_srs).
+ *
+ * <p>Diagnostics: the {@code @Inject} into {@code tick} is gated behind {@link
+ * Debug#ENABLED} (toggled by {@code /cs debug}); default off means it is a no-op and
+ * emits nothing.
+ */
+@Mixin(PersistentEntitySectionManager.class)
+public abstract class PersistentEntitySectionManagerMixin {
+
+    @Unique
+    private static final Logger CHUNKY$LOG = LogUtils.getLogger();
+
+    @Unique
+    private static final long CHUNKY$DIAG_INTERVAL_MS = 5000L;
+
+    // Diagnostic counters only. Touched from the IOWorker thread (the probe) and read from the main
+    // thread (the debug tick), so use atomics to avoid a torn long even though the values are advisory.
+    @Unique private final AtomicLong chunksmith$fastHits = new AtomicLong();
+    @Unique private final AtomicLong chunksmith$vanillaFalls = new AtomicLong();
+    @Unique private long chunksmith$lastDiag = 0L;
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    @Redirect(
+            method = "requestChunkLoad",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/world/level/entity/EntityPersistentStorage;loadEntities(Lnet/minecraft/world/level/ChunkPos;)Ljava/util/concurrent/CompletableFuture;"
+            )
+    )
+    private CompletableFuture chunksmith$skipReadForFreshChunks(EntityPersistentStorage permanentStorage, ChunkPos pos) {
+        if (!(permanentStorage instanceof EntityStorage)) {
+            return permanentStorage.loadEntities(pos);
+        }
+
+        //[[[cog
+        // import cog, compat
+        // cog.outl('        final %s executor;' % compat.ioworker_executor_type(mcver))
+        // cog.outl('        final %s<?, ?> pendingWrites;' % compat.pending_writes_type(mcver))
+        //]]]
+        //[[[end]]]
+        Path entityRegionFolder;
+        try {
+            //[[[cog
+            // import cog, compat
+            // # AXIS B -- reach the IOWorker from the EntityStorage.
+            // if compat.entity_storage_uses_srs(mcver):
+            //     cog.outl('            final SimpleRegionStorage simpleRegionStorage = ((EntityStorageAccessor) permanentStorage).chunksmith$getSimpleRegionStorage();')
+            //     if compat.use_mailbox_executor(mcver):
+            //         cog.outl('            final IOWorker rawWorker = ((SimpleRegionStorageAccessor) (Object) simpleRegionStorage).chunksmith$getWorker();')
+            //         cog.outl('            final IOWorkerAccessor worker = (IOWorkerAccessor) (Object) rawWorker;')
+            //     else:
+            //         cog.outl('            final IOWorkerAccessor worker = (IOWorkerAccessor) (Object) ((SimpleRegionStorageAccessor) (Object) simpleRegionStorage).chunksmith$getWorker();')
+            // else:
+            //     # ANCIENT: EntityStorage holds its IOWorker directly (no SimpleRegionStorage layer).
+            //     cog.outl('            final IOWorker rawWorker = ((EntityStorageAccessor) permanentStorage).chunksmith$getEntityWorker();')
+            //     cog.outl('            final IOWorkerAccessor worker = (IOWorkerAccessor) (Object) rawWorker;')
+            // # AXIS A -- grab the executor primitive off the worker.
+            // cog.outl('            executor = worker.%s();' % compat.ioworker_executor_getter(mcver))
+            //]]]
+            //[[[end]]]
+            pendingWrites = worker.chunksmith$getPendingWrites();
+            RegionFileStorage storage = worker.chunksmith$getStorage();
+            entityRegionFolder = ((RegionFileStorageAccessor) (Object) storage).chunksmith$getFolder();
+        } catch (Throwable introspectionFailed) {
+            // Cannot reach the worker internals -> never gamble, do the real vanilla load.
+            return permanentStorage.loadEntities(pos);
+        }
+
+        // Decide on the worker's own single thread, where pendingWrites and the region files are
+        // quiescent. "Present" means entity data exists either queued in pendingWrites or on disk; any
+        // doubt resolves to present so we never skip a merge that was actually needed.
+        //[[[cog
+        // import cog, compat
+        // if compat.use_mailbox_executor(mcver):
+        //     cog.outl('        final CompletableFuture<Boolean> probe = new CompletableFuture<>();')
+        //     cog.outl('        executor.tell(new StrictQueue.IntRunnable(0, () -> {')
+        //     cog.outl('            boolean present;')
+        //     cog.outl('            try {')
+        //     cog.outl('                present = pendingWrites.containsKey(pos) || chunksmith$entitiesOnDisk(entityRegionFolder, pos);')
+        //     cog.outl('            } catch (final Throwable uncertain) {')
+        //     cog.outl('                present = true;')
+        //     cog.outl('            }')
+        //     cog.outl('            if (present) {')
+        //     cog.outl('                this.chunksmith$vanillaFalls.incrementAndGet();')
+        //     cog.outl('            } else {')
+        //     cog.outl('                this.chunksmith$fastHits.incrementAndGet();')
+        //     cog.outl('            }')
+        //     cog.outl('            probe.complete(present);')
+        //     cog.outl('        }));')
+        //     cog.outl('        return probe.thenCompose(present -> present')
+        //     cog.outl('                ? permanentStorage.loadEntities(pos)')
+        //     cog.outl('                : CompletableFuture.completedFuture(new ChunkEntities(pos, List.of())));')
+        // else:
+        //     cog.outl('        return executor.<Boolean>scheduleWithResult(0, (final CompletableFuture<Boolean> result) -> {')
+        //     cog.outl('            boolean present;')
+        //     cog.outl('            try {')
+        //     cog.outl('                present = pendingWrites.containsKey(pos) || chunksmith$entitiesOnDisk(entityRegionFolder, pos);')
+        //     cog.outl('            } catch (final Throwable uncertain) {')
+        //     cog.outl('                present = true;')
+        //     cog.outl('            }')
+        //     cog.outl('            if (present) {')
+        //     cog.outl('                this.chunksmith$vanillaFalls.incrementAndGet();')
+        //     cog.outl('            } else {')
+        //     cog.outl('                this.chunksmith$fastHits.incrementAndGet();')
+        //     cog.outl('            }')
+        //     cog.outl('            result.complete(present);')
+        //     cog.outl('        }).thenCompose(present -> present')
+        //     cog.outl('                ? permanentStorage.loadEntities(pos)')
+        //     cog.outl('                : CompletableFuture.completedFuture(new ChunkEntities(pos, List.of())));')
+        //]]]
+        //[[[end]]]
+    }
+
+    @Inject(method = "tick", at = @At("HEAD"), require = 0)
+    private void chunksmith$debugTick(CallbackInfo ci) {
+        if (!Debug.ENABLED) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - this.chunksmith$lastDiag < CHUNKY$DIAG_INTERVAL_MS) {
+            return;
+        }
+        this.chunksmith$lastDiag = now;
+        try {
+            // gatherStats() CSV: known,visible,sections,loadStatuses,visibility,inbox,toUnload
+            String stats = ((PersistentEntitySectionManager) (Object) this).gatherStats();
+            CHUNKY$LOG.info("[Chunksmith debug] fastHits={} vanillaFalls={} | known,visible,sections,loadStatuses,visibility,inbox,toUnload={}",
+                    this.chunksmith$fastHits.get(), this.chunksmith$vanillaFalls.get(), stats);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * True iff the entity region file for this chunk exists and its 4096-byte offset
+     * table marks this chunk's slot as present. MUST be called on the IOWorker executor
+     * thread so the read is serialized against region writes (no torn header) and never
+     * creates a region file (Files.exists gate).
+     */
+    @Unique
+    private static boolean chunksmith$entitiesOnDisk(Path folder, ChunkPos pos) throws IOException {
+        Path mca = folder.resolve("r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca");
+        if (!Files.exists(mca)) {
+            return false;
+        }
+        int slot = pos.getRegionLocalX() + pos.getRegionLocalZ() * 32; // 0..1023
+        try (FileChannel channel = FileChannel.open(mca, StandardOpenOption.READ)) {
+            ByteBuffer header = ByteBuffer.allocate(4096);
+            while (header.hasRemaining()) {
+                if (channel.read(header) < 0) {
+                    break;
+                }
+            }
+            if (header.position() < (slot + 1) * 4) {
+                return false;
+            }
+            return header.getInt(slot * 4) != 0;
+        }
+    }
+}

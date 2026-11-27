@@ -1,0 +1,122 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.platform.impl;
+
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * The settle settings as seen through {@code /cs settle}.
+ *
+ * <p>The house rule (every key in the config file has a command that can set it) is only true if the
+ * SETTER half works, and a setter has two jobs the getter does not: survive a restart, and refuse a
+ * value the getter would later clamp.
+ *
+ * <p>These tests drive {@link GsonConfig} directly rather than the command, because that is where both
+ * jobs actually live; the command only forwards and reads back.
+ */
+public class GsonConfigSettleTest {
+
+    @Rule
+    public TemporaryFolder folder = new TemporaryFolder();
+
+    private Path configPath() throws IOException {
+        return folder.newFolder("chunksmith").toPath().resolve("config.json");
+    }
+
+    @Test
+    public void settleDefaults() throws IOException {
+        GsonConfig config = new GsonConfig(configPath());
+        assertTrue("settle is ON by default",
+                config.isPregenSettleEnabled());
+        assertEquals(40L, config.getPregenSettleDelayTicks());
+        assertEquals(7, config.getPregenSettleRadius());
+        assertTrue("a real platform supports settle", config.isPregenSettleSupported());
+    }
+
+    @Test
+    public void freshConfigHasSettleKeys() throws IOException {
+        Path path = configPath();
+        new GsonConfig(path);
+        String written = Files.readString(path);
+        assertTrue("pregenSettle missing from a freshly written config", written.contains("pregenSettle"));
+        assertTrue(written.contains("pregenSettleDelayTicks"));
+        assertTrue(written.contains("pregenSettleRadius"));
+    }
+
+    @Test
+    public void settingsSurviveAReload() throws IOException {
+        Path path = configPath();
+        GsonConfig first = new GsonConfig(path);
+        first.setPregenSettleEnabled(false);
+        first.setPregenSettleDelayTicks(120L);
+        first.setPregenSettleRadius(11);
+
+        GsonConfig reloaded = new GsonConfig(path);
+        assertFalse(reloaded.isPregenSettleEnabled());
+        assertEquals(120L, reloaded.getPregenSettleDelayTicks());
+        assertEquals(11, reloaded.getPregenSettleRadius());
+    }
+
+    @Test
+    public void clampsBeforeWrite() throws IOException {
+        Path path = configPath();
+        GsonConfig config = new GsonConfig(path);
+
+        config.setPregenSettleDelayTicks(10_000L);
+        assertEquals("delay clamps to its documented maximum", 600L, config.getPregenSettleDelayTicks());
+
+        config.setPregenSettleDelayTicks(-5L);
+        assertEquals("delay cannot go negative", 0L, config.getPregenSettleDelayTicks());
+
+        config.setPregenSettleRadius(999);
+        assertEquals("radius clamps to its documented maximum", 16, config.getPregenSettleRadius());
+
+        config.setPregenSettleRadius(0);
+        assertEquals("radius floors at 1", 1, config.getPregenSettleRadius());
+
+        GsonConfig reloaded = new GsonConfig(path);
+        assertEquals("clamped value was persisted", 1, reloaded.getPregenSettleRadius());
+        assertEquals(0L, reloaded.getPregenSettleDelayTicks());
+    }
+
+    @Test
+    public void aConfigFromAnEarlierVersionReadsAsTheDefaults() throws IOException {
+        Path path = configPath();
+        Files.createDirectories(path.getParent());
+        Files.writeString(path, "{\n  \"version\": 2,\n  \"language\": \"en\",\n  \"silent\": false\n}\n");
+
+        GsonConfig config = new GsonConfig(path);
+        assertTrue(config.isPregenSettleEnabled());
+        assertEquals(40L, config.getPregenSettleDelayTicks());
+        assertEquals(7, config.getPregenSettleRadius());
+    }
+}

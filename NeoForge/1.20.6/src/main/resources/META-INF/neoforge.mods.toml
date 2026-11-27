@@ -1,0 +1,35 @@
+modLoader="javafml"
+loaderVersion="[3,)"
+license="GNU GPLv3"
+issueTrackerURL="https://github.com/Kishku7/mod_support/issues"
+[[mods]]
+modId="${id}"
+version="${version}"
+displayName="${name}"
+displayURL="${github}"
+logoFile="icon.png"
+authors="${author}, pop4959"
+description="${description}"
+[[mixins]]
+config="chunksmith.mixins.json"
+[[dependencies.${id}]]
+   modId="neoforge"
+   type="required"
+   versionRange="${neoforgeRange}"
+   ordering="NONE"
+   side="BOTH"
+[[dependencies.${id}]]
+   modId="minecraft"
+   type="required"
+   versionRange="${mcRange}"
+   ordering="NONE"
+   side="BOTH"
+
+# ChunkyStalker is a fork of Chunksmith and ships the same Java packages. Both in one instance would
+# collide on every class, so refuse it up front with a readable message instead.
+[[dependencies.${id}]]
+   modId="chunksmith"
+   type="incompatible"
+   versionRange="[0,)"
+   ordering="NONE"
+   side="BOTH"

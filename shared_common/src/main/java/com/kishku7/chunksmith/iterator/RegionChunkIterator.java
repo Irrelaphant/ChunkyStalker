@@ -1,0 +1,262 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ * Copyright (C) pop4959 and contributors.
+ *
+ * This file is derived from Chunky (https://github.com/pop4959/Chunky).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.iterator;
+
+import com.kishku7.chunksmith.Selection;
+import com.kishku7.chunksmith.util.ChunkCoordinate;
+import com.kishku7.chunksmith.util.Hilbert;
+
+import java.util.NoSuchElementException;
+
+public class RegionChunkIterator implements ChunkIterator {
+    private final int centerRegionX;
+    private final int centerRegionZ;
+    private final int radiusRegions;
+    private final int minChunkX;
+    private final int minChunkZ;
+    private final int maxChunkX;
+    private final int maxChunkZ;
+    private final long totalChunks;
+    private RegionChunkProgress currentRegionProgress;
+    private int regionX;
+    private int regionZ;
+    private int annulusRegions;
+    private int spanRegions;
+    private int downRegions;
+    private int leftRegions;
+    private int upRegions;
+    private int rightRegions;
+    private boolean hasNextRegion = true;
+    private boolean hasNext = true;
+
+    public RegionChunkIterator(Selection selection, long count) {
+        this(selection);
+        if (count <= 0) {
+            return;
+        }
+        this.currentRegionProgress = null;
+        this.regionX = centerRegionX;
+        this.regionZ = centerRegionZ;
+        this.annulusRegions = 0;
+        this.spanRegions = 0;
+        this.downRegions = this.leftRegions = this.upRegions = this.rightRegions = 0;
+        this.hasNextRegion = true;
+        this.hasNext = true;
+        long countRemainingChunks = count;
+        long estimatedRegionCount = count / 1024;
+        int estimatedDiameterRegions = (int) Math.floor(Math.sqrt(estimatedRegionCount));
+        if (estimatedDiameterRegions % 2 == 0) {
+            --estimatedDiameterRegions;
+        }
+        if (estimatedDiameterRegions > 2) {
+            int skipDiameterRegions = estimatedDiameterRegions - 2;
+            this.annulusRegions = skipDiameterRegions / 2 + 1;
+            this.regionX += annulusRegions;
+            this.regionZ += annulusRegions - 1;
+            this.spanRegions = 2 * annulusRegions;
+            ++this.downRegions;
+            long skipChunks = ((long) skipDiameterRegions * skipDiameterRegions) * 1024;
+            countRemainingChunks -= skipChunks;
+        }
+        currentRegionProgress = nextRegionChunkProgress(countRemainingChunks);
+        countRemainingChunks -= Math.min(countRemainingChunks, currentRegionProgress == null ? 0 : currentRegionProgress.total());
+        while (currentRegionProgress != null && !currentRegionProgress.hasNext()) {
+            currentRegionProgress = nextRegionChunkProgress(countRemainingChunks);
+            countRemainingChunks -= Math.min(countRemainingChunks, currentRegionProgress == null ? 0 : currentRegionProgress.total());
+        }
+        if (currentRegionProgress == null) {
+            hasNext = false;
+        }
+    }
+
+    public RegionChunkIterator(Selection selection) {
+        this.centerRegionX = selection.centerRegionX();
+        this.centerRegionZ = selection.centerRegionZ();
+        this.radiusRegions = selection.radiusRegionsX();
+        int centerChunkX = selection.centerChunkX();
+        int centerChunkZ = selection.centerChunkZ();
+        int radiusChunks = selection.radiusChunksX();
+        this.minChunkX = centerChunkX - radiusChunks;
+        this.minChunkZ = centerChunkZ - radiusChunks;
+        this.maxChunkX = centerChunkX + radiusChunks;
+        this.maxChunkZ = centerChunkZ + radiusChunks;
+        this.regionX = centerRegionX;
+        this.regionZ = centerRegionZ;
+        long diameterChunks = selection.diameterChunksX();
+        this.totalChunks = diameterChunks * diameterChunks;
+        this.currentRegionProgress = nextRegionChunkProgress();
+    }
+
+    @Override
+    public boolean hasNext() {
+        return hasNext;
+    }
+
+    @Override
+    public ChunkCoordinate next() {
+        if (!hasNext) {
+            throw new NoSuchElementException();
+        }
+        ChunkCoordinate chunkCoord = currentRegionProgress.next();
+        while (currentRegionProgress != null && !currentRegionProgress.hasNext()) {
+            currentRegionProgress = nextRegionChunkProgress();
+        }
+        if (currentRegionProgress == null) {
+            hasNext = false;
+        }
+        return chunkCoord;
+    }
+
+    private RegionChunkProgress nextRegionChunkProgress() {
+        return nextRegionChunkProgress(0);
+    }
+
+    private RegionChunkProgress nextRegionChunkProgress(long count) {
+        if (!hasNextRegion) {
+            return null;
+        }
+        RegionChunkProgress regionChunkProgress = new RegionChunkProgress(regionX, regionZ, count);
+        if (regionX == centerRegionX + annulusRegions && regionZ == centerRegionZ + annulusRegions) {
+            ++annulusRegions;
+            ++regionX;
+            ++regionZ;
+            if (annulusRegions > radiusRegions) {
+                hasNextRegion = false;
+            }
+            spanRegions = 2 * annulusRegions;
+            downRegions = leftRegions = upRegions = rightRegions = 0;
+        }
+        if (downRegions < spanRegions) {
+            --regionZ;
+            ++downRegions;
+        } else if (leftRegions < spanRegions) {
+            --regionX;
+            ++leftRegions;
+        } else if (upRegions < spanRegions) {
+            ++regionZ;
+            ++upRegions;
+        } else if (rightRegions < spanRegions) {
+            ++regionX;
+            ++rightRegions;
+        }
+        return regionChunkProgress;
+    }
+
+    @Override
+    public long total() {
+        return totalChunks;
+    }
+
+    @Override
+    public String name() {
+        return PatternType.REGION;
+    }
+
+    public final class RegionChunkProgress implements ChunkIterator {
+        private final int minX;
+        private final int minZ;
+        private final int sizeZ;
+        private final int total;
+        private final boolean full;
+        private final String name;
+        private int current;
+        private int offsetX;
+        private int offsetZ;
+        private boolean hasNext = true;
+
+        public RegionChunkProgress(int x, int z, long count) {
+            this(x, z);
+            if (count <= 0) {
+                return;
+            }
+            this.current = (int) Math.min(count, 1024);
+            if (!full && sizeZ > 0) {
+                offsetX = current / sizeZ;
+                offsetZ = current % sizeZ;
+            }
+            if (current >= total) {
+                this.hasNext = false;
+            }
+        }
+
+        public RegionChunkProgress(int x, int z) {
+            int lowEdgeX = x << 5;
+            int lowEdgeZ = z << 5;
+            int highEdgeX = lowEdgeX + 31;
+            int highEdgeZ = lowEdgeZ + 31;
+            this.minX = Math.max(lowEdgeX, minChunkX);
+            this.minZ = Math.max(lowEdgeZ, minChunkZ);
+            int maxX = Math.min(highEdgeX, maxChunkX);
+            int maxZ = Math.min(highEdgeZ, maxChunkZ);
+            int sizeX = maxX - minX + 1;
+            if (minX > highEdgeX || minZ > highEdgeZ || maxX < lowEdgeX || maxZ < lowEdgeZ) {
+                this.sizeZ = 0;
+                this.total = 0;
+                this.full = false;
+                this.hasNext = false;
+            } else {
+                this.sizeZ = maxZ - minZ + 1;
+                this.total = sizeX * sizeZ;
+                this.full = total == 1024;
+            }
+            this.name = "region_chunk_progress_%d_%d".formatted(x, z);
+        }
+
+        @Override
+        public boolean hasNext() {
+            return hasNext;
+        }
+
+        @Override
+        public ChunkCoordinate next() {
+            if (!hasNext) {
+                throw new NoSuchElementException();
+            }
+            ChunkCoordinate chunkCoord;
+            if (full) {
+                ChunkCoordinate offset = Hilbert.regionDistanceToChunkCoordinateOffset(current);
+                chunkCoord = new ChunkCoordinate(minX + offset.x(), minZ + offset.z());
+            } else {
+                chunkCoord = new ChunkCoordinate(minX + offsetX, minZ + offsetZ);
+                if (++offsetZ >= sizeZ) {
+                    offsetZ = 0;
+                    ++offsetX;
+                }
+            }
+            ++current;
+            if (current >= total) {
+                hasNext = false;
+            }
+            return chunkCoord;
+        }
+
+        @Override
+        public long total() {
+            return total;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+    }
+}

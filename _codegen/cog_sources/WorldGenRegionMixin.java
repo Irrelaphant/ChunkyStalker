@@ -1,0 +1,135 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.mixin;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.WorldGenRegion;
+import net.minecraft.world.level.ChunkPos;
+//[[[cog
+// import cog, compat
+// if compat.worldgen_uses_chunkstep(mcver):
+//     cog.outl('import net.minecraft.world.level.chunk.status.ChunkStep;')
+// else:
+//     # 1.20.* two-field form. ChunkStatus moved into the .status subpackage at 1.20.5, so
+//     # ancient (1.20.1/1.20.4) imports the bare package while transitional 1.20.6 uses .status.
+//     cog.outl(compat.chunkstatus_import(mcver))
+//]]]
+//[[[end]]]
+import com.kishku7.chunksmith.util.WorldgenOverreachReporter;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Redirect;
+
+import java.util.function.Supplier;
+
+/**
+ * Captures vanilla "Detected setBlock in a far chunk" worldgen overreaches
+ * and routes them to {@link WorldgenOverreachReporter} as aggregated
+ * single-line reports. The block is still refused exactly as vanilla does
+ * (ensureCanWrite still returns false) - only the logging is intercepted.
+ *
+ * <p>COG DRIFT: the far-write log call is Util.logAndPauseIfInIde(String),
+ * whose owning class moved package at 1.21.11 (net.minecraft.Util ->
+ * net.minecraft.util.Util). That is a STRING inside a mixin annotation, so a
+ * reflection facade cannot touch it; the @At target descriptor is Cog-emitted
+ * (compat.util_at_target), as are the dimension-id accessor and the ChunkPos
+ * coord access.
+ */
+@Mixin(WorldGenRegion.class)
+public abstract class WorldGenRegionMixin {
+    //[[[cog
+    // import cog, compat
+    // if compat.worldgen_uses_chunkstep(mcver):
+    //     cog.outl('    @Shadow')
+    //     cog.outl('    @Final')
+    //     cog.outl('    private ChunkStep generatingStep;')
+    // else:
+    //     cog.outl('    @Shadow')
+    //     cog.outl('    @Final')
+    //     cog.outl('    private ChunkStatus generatingStatus;')
+    //     cog.outl('    @Shadow')
+    //     cog.outl('    @Final')
+    //     cog.outl('    private int writeRadiusCutoff;')
+    //]]]
+    //[[[end]]]
+    @Shadow
+    @Final
+    private ServerLevel level;
+    @Shadow
+    private Supplier<String> currentlyGenerating;
+
+    @Shadow
+    public abstract ChunkPos getCenter();
+
+    @Redirect(
+            method = "ensureCanWrite",
+            require = 0,
+            //[[[cog
+            // import cog, compat
+            // cog.outl('at = @At(value = "INVOKE", target = "%s")' % compat.util_at_target(mcver))
+            //]]]
+            //[[[end]]]
+    )
+    private void chunksmith$captureFarWrite(String message, BlockPos pos) {
+        try {
+            String feature = this.currentlyGenerating == null ? null : String.valueOf(this.currentlyGenerating.get());
+            //[[[cog
+            // import cog, compat
+            // if compat.worldgen_uses_chunkstep(mcver):
+            //     cog.outl('final String step = String.valueOf(this.generatingStep.targetStatus());')
+            // else:
+            //     cog.outl('final String step = String.valueOf(this.generatingStatus);')
+            //]]]
+            //[[[end]]]
+            //[[[cog
+            // import cog, compat
+            // cog.outl('final String dimension = this.level.dimension().%s().toString();' % compat.dimension_identifier_call(mcver))
+            //]]]
+            //[[[end]]]
+            ChunkPos center = this.getCenter();
+            //[[[cog
+            // import cog, compat
+            // if compat.worldgen_uses_chunkstep(mcver):
+            //     cog.outl('final int writeRadius = this.generatingStep.blockStateWriteRadius();')
+            // else:
+            //     cog.outl('final int writeRadius = this.writeRadiusCutoff;')
+            //]]]
+            //[[[end]]]
+            //[[[cog
+            // import cog, compat
+            // cog.outl('WorldgenOverreachReporter.get().record(')
+            // cog.outl('        feature, step, dimension,')
+            // cog.outl('        center.%s, center.%s,' % (compat.chunkpos_x(mcver), compat.chunkpos_z(mcver)))
+            // cog.outl('        SectionPos.blockToSectionCoord(pos.getX()),')
+            // cog.outl('        SectionPos.blockToSectionCoord(pos.getZ()),')
+            // cog.outl('        pos.getY(), writeRadius);')
+            //]]]
+            //[[[end]]]
+        } catch (Throwable ignored) {
+            // Diagnostics must never break worldgen.
+        }
+    }
+}

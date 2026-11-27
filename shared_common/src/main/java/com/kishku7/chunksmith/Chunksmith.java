@@ -1,0 +1,246 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith;
+
+import com.kishku7.chunksmith.api.ChunksmithAPI;
+import com.kishku7.chunksmith.api.ChunksmithAPIImpl;
+import com.kishku7.chunksmith.command.CancelCommand;
+import com.kishku7.chunksmith.command.CenterCommand;
+import com.kishku7.chunksmith.command.ChunksmithCommand;
+import com.kishku7.chunksmith.command.CommandLiteral;
+import com.kishku7.chunksmith.command.ConfirmCommand;
+import com.kishku7.chunksmith.command.ContinueCommand;
+import com.kishku7.chunksmith.command.CornersCommand;
+import com.kishku7.chunksmith.command.DebugCommand;
+import com.kishku7.chunksmith.command.HelpCommand;
+import com.kishku7.chunksmith.command.PatternCommand;
+import com.kishku7.chunksmith.command.PauseCommand;
+import com.kishku7.chunksmith.command.ProgressCommand;
+import com.kishku7.chunksmith.command.QuietCommand;
+import com.kishku7.chunksmith.command.HorizonCommand;
+import com.kishku7.chunksmith.command.RadiusCommand;
+import com.kishku7.chunksmith.command.ReloadCommand;
+import com.kishku7.chunksmith.command.SelectionCommand;
+import com.kishku7.chunksmith.command.ShapeCommand;
+import com.kishku7.chunksmith.command.SetCommand;
+import com.kishku7.chunksmith.command.SilentCommand;
+import com.kishku7.chunksmith.command.SpawnCommand;
+import com.kishku7.chunksmith.command.StalkerCommand;
+import com.kishku7.chunksmith.stalker.ChunkyStalker;
+import com.kishku7.chunksmith.command.StatusCommand;
+import com.kishku7.chunksmith.command.StartCommand;
+import com.kishku7.chunksmith.command.TrimCommand;
+import com.kishku7.chunksmith.command.WorldBorderCommand;
+import com.kishku7.chunksmith.command.WorldCommand;
+import com.kishku7.chunksmith.event.EventBus;
+import com.kishku7.chunksmith.platform.Config;
+import com.kishku7.chunksmith.platform.Sender;
+import com.kishku7.chunksmith.platform.Server;
+import com.kishku7.chunksmith.util.Input;
+import com.kishku7.chunksmith.util.PendingAction;
+import com.kishku7.chunksmith.util.RegionCache;
+import com.kishku7.chunksmith.util.TaskLoader;
+import com.kishku7.chunksmith.util.TaskScheduler;
+import com.kishku7.chunksmith.util.Translator;
+import com.kishku7.chunksmith.util.Version;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import com.kishku7.chunksmith.util.AutoPause;
+import com.kishku7.chunksmith.util.ChunkResidency;
+import com.kishku7.chunksmith.util.ChunkSettleSupport;
+
+public final class Chunksmith {
+    private final Server server;
+    private final Config config;
+    private final TaskLoader taskLoader;
+    private final EventBus eventBus;
+    private final Selection.Builder selection;
+    private final TaskScheduler scheduler = new TaskScheduler();
+    private final Map<String, GenerationTask> generationTasks = new ConcurrentHashMap<>();
+    private final Map<String, TrimCommand.Task> trimTasks = new ConcurrentHashMap<>();
+    private final Map<String, PendingAction> pendingActions = new HashMap<>();
+    private final RegionCache regionCache = new RegionCache();
+    private final double limit;
+    private final Version version;
+    private final Map<String, ChunksmithCommand> commands;
+    private final ChunksmithAPI api;
+    private final ChunkyStalker stalker;
+
+    public Chunksmith(Server server, Config config) {
+        this.server = server;
+        this.config = config;
+        this.taskLoader = new TaskLoader(this);
+        this.eventBus = new EventBus();
+        this.selection = Selection.builder(this, server.getWorlds().get(0));
+        this.limit = loadLimit().orElse(Double.MAX_VALUE);
+        this.version = loadVersion();
+        this.stalker = new ChunkyStalker(this);
+        this.commands = loadCommands();
+        this.api = new ChunksmithAPIImpl(this);
+        ChunksmithProvider.register(this);
+    }
+
+    public void disable() {
+        stalker.disable();
+        taskLoader.saveTasks();
+        getGenerationTasks().values().forEach(generationTask -> generationTask.stop(false));
+        getScheduler().cancelTasks();
+        // Static state must not outlive its server. A residency reading or a registered settle window
+        // left behind here would be read by the NEXT server in this JVM -- an integrated server opened
+        // after leaving a world -- and would be about a world that no longer exists.
+        AutoPause.clear();
+        ChunkResidency.clear();
+        ChunkSettleSupport.forget();
+        ChunksmithProvider.unregister();
+    }
+
+    private Optional<Double> loadLimit() {
+        Path limitFile = config.getDirectory().resolve(".chunky.properties");
+        try (final InputStream input = Files.newInputStream(limitFile)) {
+            Properties properties = new Properties();
+            properties.load(input);
+            return Input.tryDouble(properties.getProperty("radius-limit"));
+        } catch (IOException e) {
+            return Optional.empty();
+        }
+    }
+
+    private Version loadVersion() {
+        try (final InputStream input = getClass().getClassLoader().getResourceAsStream("version.properties")) {
+            Properties properties = new Properties();
+            properties.load(input);
+            return new Version(properties.getProperty("version"));
+        } catch (IOException e) {
+            return Version.INVALID;
+        }
+    }
+
+    private Map<String, ChunksmithCommand> loadCommands() {
+        Map<String, ChunksmithCommand> commandMap = new HashMap<>();
+        commandMap.put(CommandLiteral.CANCEL, new CancelCommand(this));
+        commandMap.put(CommandLiteral.CENTER, new CenterCommand(this));
+        commandMap.put(CommandLiteral.CONFIRM, new ConfirmCommand(this));
+        commandMap.put(CommandLiteral.CONTINUE, new ContinueCommand(this));
+        commandMap.put(CommandLiteral.CORNERS, new CornersCommand(this));
+        DebugCommand debugCommand = new DebugCommand(this);
+        commandMap.put(CommandLiteral.DEBUG, debugCommand);
+        commandMap.put(CommandLiteral.DIAG, debugCommand);
+        commandMap.put(CommandLiteral.HELP, new HelpCommand(this));
+        commandMap.put(CommandLiteral.HORIZON, new HorizonCommand(this));
+        commandMap.put(CommandLiteral.PATTERN, new PatternCommand(this));
+        commandMap.put(CommandLiteral.PAUSE, new PauseCommand(this));
+        commandMap.put(CommandLiteral.PROGRESS, new ProgressCommand(this));
+        commandMap.put(CommandLiteral.QUIET, new QuietCommand(this));
+        commandMap.put(CommandLiteral.RADIUS, new RadiusCommand(this));
+        commandMap.put(CommandLiteral.RELOAD, new ReloadCommand(this));
+        commandMap.put(CommandLiteral.SELECTION, new SelectionCommand(this));
+        commandMap.put(CommandLiteral.SHAPE, new ShapeCommand(this));
+        commandMap.put(CommandLiteral.SET, new SetCommand(this));
+        commandMap.put(CommandLiteral.SILENT, new SilentCommand(this));
+        commandMap.put(CommandLiteral.SPAWN, new SpawnCommand(this));
+        commandMap.put(CommandLiteral.STATUS, new StatusCommand(this));
+        commandMap.put(CommandLiteral.STALKER, new StalkerCommand(this));
+        commandMap.put(CommandLiteral.START, new StartCommand(this));
+        commandMap.put(CommandLiteral.TRIM, new TrimCommand(this));
+        commandMap.put(CommandLiteral.WORLDBORDER, new WorldBorderCommand(this));
+        commandMap.put(CommandLiteral.WORLD, new WorldCommand(this));
+        return commandMap;
+    }
+
+    public TaskScheduler getScheduler() {
+        return scheduler;
+    }
+
+    public Server getServer() {
+        return server;
+    }
+
+    public Config getConfig() {
+        return config;
+    }
+
+    public TaskLoader getTaskLoader() {
+        return taskLoader;
+    }
+
+    public EventBus getEventBus() {
+        return eventBus;
+    }
+
+    public Map<String, GenerationTask> getGenerationTasks() {
+        return generationTasks;
+    }
+
+    public Map<String, TrimCommand.Task> getTrimTasks() {
+        return trimTasks;
+    }
+
+    public Map<String, ChunksmithCommand> getCommands() {
+        return commands;
+    }
+
+    public Selection.Builder getSelection() {
+        return selection;
+    }
+
+    public Optional<Runnable> getPendingAction(Sender sender) {
+        pendingActions.values().removeIf(PendingAction::hasExpired);
+        PendingAction pendingAction = pendingActions.remove(sender.getName());
+        return Optional.ofNullable(pendingAction).map(PendingAction::getAction);
+    }
+
+    public void setPendingAction(Sender sender, Runnable action) {
+        pendingActions.put(sender.getName(), new PendingAction(action));
+    }
+
+    public void setLanguage(String language) {
+        Translator.setLanguage(language);
+    }
+
+    public RegionCache getRegionCache() {
+        return regionCache;
+    }
+
+    public double getLimit() {
+        return limit;
+    }
+
+    public Version getVersion() {
+        return version;
+    }
+
+    public ChunksmithAPI getApi() {
+        return api;
+    }
+
+    public ChunkyStalker getStalker() {
+        return stalker;
+    }
+}

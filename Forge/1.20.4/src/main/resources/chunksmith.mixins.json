@@ -1,0 +1,29 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.kishku7.chunksmith.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "chunksmith.refmap.json",
+  "mixins": [
+    "ChunkMapMixin",
+    "ChunkStorageAccessor",
+    "EntityStorageAccessor",
+    "HangingEntityMixin",
+    "IOWorkerAccessor",
+    "LevelEntityFreezeMixin",
+    "MinecraftServerMixin",
+    "PersistentEntitySectionManagerMixin",
+    "RegionFileStorageAccessor",
+    "ServerChunkCacheMixin",
+    "ServerLevelFreezeMixin",
+    "ServerLevelMixin",
+    "StructureStartMixin",
+    "WorldGenRegionMixin"
+  ],
+  "client": [
+    "client.IntegratedServerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

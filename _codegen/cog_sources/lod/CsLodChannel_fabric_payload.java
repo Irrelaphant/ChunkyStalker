@@ -1,0 +1,106 @@
+/*
+ * Chunksmith -- a chunk pre-generator for Minecraft.
+ * Copyright (C) 2025-2026 Kishku7
+ *
+ * Chunksmith is a fork of Chunky (https://github.com/pop4959/Chunky)
+ * by pop4959 and contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.kishku7.chunksmith.lod.net;
+
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+//[[[cog
+// import cog, compat
+// cog.outl(compat.identifier_import(mcver))
+//]]]
+//[[[end]]]
+import net.minecraft.server.level.ServerPlayer;
+
+/**
+ * Fabric's payload-era registration door for {@code chunksmith:lod} (MC 1.20.5+), and nothing more
+ * than that. All the protocol lives in {@code CsLodMessages} / {@code CsLodProtocol} in
+ * shared_common, which know nothing about Minecraft, so the Chunksmith server and client halves
+ * (a different mod, in a different repo, possibly on a different loader) share one implementation of
+ * the wire format instead of maintaining two that drift. The same bytes also travel over the HTTP
+ * backchannel and sit on disk in the store: one format, three uses.
+ *
+ * <p>The channel id ({@code chunksmith:lod}) and the payload shape (one raw byte block) are
+ * identical on every loader and every MC version -- only the registration API differs, and that
+ * difference stops here.
+ */
+public final class CsLodChannel {
+
+    private CsLodChannel() {
+    }
+
+    /** Registers the channel and the disconnect hook. Called at mod init, before any server exists. */
+    public static void register() {
+        //[[[cog
+        // import cog, compat
+        // # fabric-api renamed these two accessors at its MC 26 module major (v6): playC2S/playS2C ->
+        // # serverboundPlay/clientboundPlay. Nothing else in the payload path drifts.
+        // cog.outl("PayloadTypeRegistry.%s().register(Payload.TYPE, Payload.CODEC);"
+        //          % compat.fabric_payload_registry_call(mcver, "serverbound"))
+        // cog.outl("PayloadTypeRegistry.%s().register(Payload.TYPE, Payload.CODEC);"
+        //          % compat.fabric_payload_registry_call(mcver, "clientbound"))
+        //]]]
+        //[[[end]]]
+
+        ServerPlayNetworking.registerGlobalReceiver(Payload.TYPE, (payload, context) ->
+                context.server().execute(() -> CsLodServerNet.receive(context.player(), payload.data())));
+
+        // A token must never outlive the session that earned it.
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, ignored) ->
+                CsLodServerNet.onDisconnect(handler.getPlayer().getUUID()));
+    }
+
+    /** Sends raw protocol bytes to a player. */
+    public static void send(ServerPlayer player, byte[] data) {
+        ServerPlayNetworking.send(player, new Payload(data));
+    }
+
+    /** The one and only in-band payload: a raw byte block. */
+    public record Payload(byte[] data) implements CustomPacketPayload {
+
+        //[[[cog
+        // import cog, compat
+        // cog.outl("public static final Type<Payload> TYPE = new Type<>(")
+        // cog.outl("        %s);" % compat.make_id_expr(mcver, "CsLodProtocol.NAMESPACE", "CsLodProtocol.CHANNEL"))
+        //]]]
+        //[[[end]]]
+
+        public static final StreamCodec<RegistryFriendlyByteBuf, Payload> CODEC =
+                StreamCodec.of(Payload::write, Payload::read);
+
+        private static void write(RegistryFriendlyByteBuf buf, Payload payload) {
+            buf.writeByteArray(payload.data());
+        }
+
+        private static Payload read(RegistryFriendlyByteBuf buf) {
+            return new Payload(buf.readByteArray());
+        }
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+}
